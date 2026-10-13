@@ -1,0 +1,12 @@
+/target
+# Real configs carry broker hostnames and profile paths; only the example is
+# tracked.
+/config.toml
+*.pass
+
+# Review-workflow scratch documents (design, exploration, reviewer notes).
+# These are working documents, not release content.
+/.claude/review-workflow/
+.gitleaks.local.toml
+CLAUDE.local.md
+.claude/settings.local.json

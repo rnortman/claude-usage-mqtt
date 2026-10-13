@@ -1,0 +1,57 @@
+[Unit]
+Description=Claude Code usage -> MQTT publisher
+Documentation=https://github.com/rnortman/claude-usage-mqtt
+# Network-online is a hint, not a guarantee; the daemon reconnects on its own,
+# so a broker that is not up yet is a non-event.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-usage-mqtt --config %h/.config/claude-usage-mqtt/config.toml
+# SIGHUP re-reads the config in place: the daemon restarts itself in-process,
+# rehydrating its scheduler state from retained topics, so a reload costs no API
+# call. An invalid config is rejected and the running one keeps going.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# The broker password comes from the environment, never the config file, so the
+# config can be synced or committed. systemd reads this file as the user.
+# Expected contents:  CLAUDE_USAGE_MQTT_PASSWORD=...
+EnvironmentFile=-%h/.config/claude-usage-mqtt/env
+
+Restart=always
+RestartSec=10
+# A crash-loop is safe by construction here: the daemon rehydrates last_poll_at
+# and the credential-refresh cooldown from retained MQTT topics, so restarts
+# neither re-hit the rate-limited API nor re-launch a Claude Code session.
+# RestartSec is therefore about log noise, not about protecting the endpoint.
+
+# `claude` is resolved on PATH, and a user service does not get ~/.local/bin —
+# which is where the native installer puts it. Without this the refresh fails
+# with ENOENT on every attempt.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# The daemon itself only reads; the credential refresh runs the profile's own
+# Claude Code CLI, and that process — a descendant, so inside this same sandbox
+# — has to rewrite ~/.claude-profiles/<name>/.credentials.json and its own state
+# under ~/.claude. So home stays writable and MemoryDenyWriteExecute is off,
+# because Claude Code is a JIT runtime and aborts at startup without W+X pages.
+# Set refresh.enabled = false in the config if you would rather have the stricter
+# sandbox and re-login by hand when a token ages out.
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-usage-mqtt
+
+[Install]
+WantedBy=default.target

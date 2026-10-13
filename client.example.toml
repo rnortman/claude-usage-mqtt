@@ -1,0 +1,23 @@
+# claude-usage CLI configuration for a client-only install (no daemon on this
+# host). Copy to ~/.config/claude-usage-mqtt/client.toml and edit.
+#
+# On a host that also runs the daemon you do not need this file: the CLI reads
+# the daemon's config.toml automatically. Use this only to point the CLI at a
+# broker on a machine where the daemon is not installed, or to override the
+# daemon's broker settings for the CLI.
+#
+# Only the [mqtt] table is read. Flags (--host, --port, --tls, --username,
+# --prefix) override these values; the built-in defaults apply to anything
+# left unset here.
+
+[mqtt]
+host = "mqtt.example.net"
+port = 8883
+tls = true
+username = "claude-usage"
+# The password is NEVER read from this file. It comes from either:
+#   * the CLAUDE_USAGE_MQTT_PASSWORD env var, or
+#   * password_file below.
+# password_file = "~/.config/claude-usage-mqtt/mqtt.pass"
+
+topic_prefix = "claude/usage"

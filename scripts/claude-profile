@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# claude-profile — run Claude Code under separate logins that share history & config.
+#
+# Mechanism: CLAUDE_CONFIG_DIR relocates ALL of Claude Code's state. We give each
+# profile its own config dir containing a private login (.credentials.json + .claude.json)
+# while symlinking the shareable dirs back into your canonical ~/.claude store, so all
+# profiles share session history, settings, plugins, skills, etc.
+#
+# Usage:
+#   claude-profile create <name>        # make a profile (then run: claude-profile login <name>)
+#   claude-profile login  <name>        # launch claude in that profile to run /login
+#   claude-profile run    <name> [args] # run claude under that profile (args passed through)
+#   claude-profile list                 # list profiles + which account each is logged into
+#   claude-profile path   <name>        # print the CLAUDE_CONFIG_DIR (for shells/containers)
+#
+set -euo pipefail
+
+# The canonical shared store. Everything not in SHARE stays private per profile.
+SHARED="${CLAUDE_SHARED_DIR:-$HOME/.claude}"
+PROFILES="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
+
+# Subpaths of ~/.claude that are account-agnostic and safe to share across profiles.
+# Anything NOT listed here stays private to each profile (safe default for new state dirs).
+SHARE=(
+  projects sessions history.jsonl
+  settings.json settings.local.json
+  plugins skills commands agents workflows workflow-tests
+  file-history shell-snapshots ide
+)
+
+die() { echo "claude-profile: $*" >&2; exit 1; }
+
+profile_dir() { echo "$PROFILES/$1"; }
+
+cmd_create() {
+  local name="${1:?usage: claude-profile create <name>}"
+  local dir; dir="$(profile_dir "$name")"
+  [ -e "$dir" ] && die "profile '$name' already exists at $dir"
+  mkdir -p "$dir"
+
+  # Symlink the shared bits back into the canonical store.
+  local item
+  for item in "${SHARE[@]}"; do
+    if [ -e "$SHARED/$item" ]; then
+      ln -s "$SHARED/$item" "$dir/$item"
+    fi
+  done
+
+  # Seed .claude.json from the current one so per-project trust/config carry over.
+  # The oauthAccount identity inside it self-heals on next /login. Credentials are
+  # deliberately NOT copied, so the profile starts logged out.
+  if [ -f "$HOME/.claude.json" ]; then
+    cp "$HOME/.claude.json" "$dir/.claude.json"
+  elif [ -f "$SHARED/.claude.json" ]; then
+    cp "$SHARED/.claude.json" "$dir/.claude.json"
+  fi
+  chmod 600 "$dir/.claude.json" 2>/dev/null || true
+
+  echo "Created profile '$name' at $dir"
+  echo "Next: claude-profile login $name   (runs /login for this account)"
+}
+
+cmd_run() {
+  local name="${1:?usage: claude-profile run <name> [claude args...]}"; shift
+  local dir; dir="$(profile_dir "$name")"
+  [ -d "$dir" ] || die "no such profile '$name' (create it first)"
+  CLAUDE_CONFIG_DIR="$dir" exec claude "$@"
+}
+
+cmd_login() {
+  local name="${1:?usage: claude-profile login <name>}"
+  local dir; dir="$(profile_dir "$name")"
+  [ -d "$dir" ] || die "no such profile '$name' (create it first)"
+  echo "Launching Claude in profile '$name'. Run /login, then /exit."
+  CLAUDE_CONFIG_DIR="$dir" exec claude
+}
+
+cmd_list() {
+  [ -d "$PROFILES" ] || { echo "(no profiles yet — claude-profile create <name>)"; return; }
+  local d name email
+  for d in "$PROFILES"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    if [ -f "$d/.credentials.json" ]; then
+      email="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress','?'))" "$d/.claude.json" 2>/dev/null || echo '?')"
+      echo "  $name  [logged in: $email]"
+    else
+      echo "  $name  [logged out — claude-profile login $name]"
+    fi
+  done
+}
+
+cmd_path() {
+  local name="${1:?usage: claude-profile path <name>}"
+  profile_dir "$name"
+}
+
+case "${1:-}" in
+  create) shift; cmd_create "$@" ;;
+  run)    shift; cmd_run "$@" ;;
+  login)  shift; cmd_login "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  path)   shift; cmd_path "$@" ;;
+  ""|-h|--help)
+    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try: create|login|run|list|path)" ;;
+esac

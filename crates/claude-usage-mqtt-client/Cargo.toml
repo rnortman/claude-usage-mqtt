@@ -1,0 +1,34 @@
+[package]
+name = "claude-usage-mqtt-client"
+description = "Client library and `claude-usage` CLI for reading claude-usage-mqtt data off the broker."
+readme = "README.md"
+keywords = ["claude", "mqtt", "usage"]
+categories = ["api-bindings", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `autobins = false` so sibling module files in `src/bin/` (e.g. `profile.rs`,
+# pulled into the CLI via `mod profile;`) are not each compiled as their own
+# binary target.
+autobins = false
+
+[[bin]]
+name = "claude-usage"
+path = "src/bin/claude-usage.rs"
+
+[dependencies]
+claude-usage-mqtt-core = { version = "0.1.0", path = "../claude-usage-mqtt-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+jiff = { workspace = true }
+rumqttc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

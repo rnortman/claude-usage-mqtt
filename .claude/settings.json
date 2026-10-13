@@ -1,0 +1,13 @@
+{
+  "agent": "review-chain:orchestrator",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "cargo fmt --all" }
+        ]
+      }
+    ]
+  }
+}

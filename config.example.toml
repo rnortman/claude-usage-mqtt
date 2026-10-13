@@ -1,0 +1,97 @@
+# claude-usage-mqtt configuration.
+# Copy to ~/.config/claude-usage-mqtt/config.toml and edit.
+
+[mqtt]
+host = "mqtt.example.net"
+port = 8883
+tls = true
+username = "claude-usage"
+# The password is NEVER read from this file. It comes from either:
+#   * the CLAUDE_USAGE_MQTT_PASSWORD env var (what the systemd unit uses), or
+#   * password_file below.
+# This keeps the config safe to sync or commit.
+# password_file = "~/.config/claude-usage-mqtt/mqtt.pass"
+
+client_id = "claude-usage-mqtt"
+topic_prefix = "claude/usage"
+keep_alive_s = 60
+
+[poll]
+# Floor on the spacing between any two API calls, across ALL profiles. Enforced
+# globally because the rate limit may be per-IP rather than per-credential —
+# assuming per-credential would double the request rate from one address.
+# Values below 60 are rejected: that is what got us rate-limited.
+min_api_interval_s = 60
+
+# Per-profile cadence band. The interval is (cadence_pivot - utilization)
+# minutes, clamped here: relaxed when there is headroom, tightening toward the
+# floor as any window approaches its limit. At 100% the reading cannot change
+# until the window resets, so the next poll targets the reset boundary instead
+# (still clamped to this band).
+profile_min_interval_s = 60
+profile_max_interval_s = 480
+cadence_pivot = 99.0
+
+# Adaptive backoff. Anthropic does not publish the actual limit, so the daemon
+# finds it by experiment: every 429 doubles the global spacing up to
+# backoff_max_s, and it takes backoff_decay_after consecutive good polls to
+# halve it back. Widening is fast and relaxing is slow on purpose.
+backoff_max_s = 1800
+backoff_decay_after = 3
+
+# Delay between a 5-hour boundary passing and the reset ping firing: the ping
+# fires at reset + this delay (default 1 minute). The API reports the roll
+# before the new window actually accepts requests, so a consumer woken at the
+# instant of reset would send its first request into the still-throttled old
+# window. Do not lower it below 60 unless you have observed the API accepting
+# requests sooner.
+reset_settle_s = 60
+
+[refresh]
+# Healing an expired access token. Claude Code renews a profile's token whenever
+# that profile is run, so the daemon runs it: the command below is launched with
+# CLAUDE_CONFIG_DIR set to the profile's config_dir (exactly what
+# `claude-profile run <name>` does) and its output is discarded. Claude Code
+# stays the only writer of .credentials.json.
+#
+# Set enabled = false on a host without the CLI, or to keep the daemon strictly
+# read-only; expired profiles then just report auth = stale and wait for a human.
+enabled = true
+
+# The CLI binary and its arguments. A bare name is resolved on PATH; anything
+# with a "/" in it is a path, and a leading ~ is expanded. The default prompt is
+# the cheapest one that still forces the renewal.
+#
+# A run is a real Claude Code session: it does not spend the daemon's
+# usage-endpoint budget, but its requests do count against the profile's 5-hour
+# window.
+command = "claude"
+args = ["-p", "/usage"]
+
+# A run that hangs — a CLI that decides to prompt, say — is killed after this
+# many seconds. The daemon's loop waits for the run (one run per tick at most,
+# and a stop request interrupts it), so keep it modest.
+timeout_s = 120
+
+# Floor on the spacing between two refresh attempts for the same profile. A
+# profile whose refresh token is dead fails every attempt, and this is what
+# stops that from spawning a CLI on every tick. Must be at least 1.
+min_interval_s = 900
+
+# One block per Claude Code profile. `config_dir` is the profile's
+# CLAUDE_CONFIG_DIR — where its .credentials.json lives.
+# `claude-profile list` shows what you have; `claude-profile path <name>` prints
+# the directory.
+
+[[profile]]
+name = "personal"
+config_dir = "~/.claude-profiles/personal"
+
+[[profile]]
+name = "work"
+config_dir = "~/.claude-profiles/work"
+
+# The default (non-profile) login, if you use it:
+# [[profile]]
+# name = "default"
+# config_dir = "~/.claude"
