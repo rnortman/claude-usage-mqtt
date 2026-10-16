@@ -238,8 +238,6 @@ async fn snapshot_decodes_the_retained_tree() {
             updated_at: Timestamp::from_second(1000).unwrap(),
             next_poll_at: Timestamp::from_second(1480).unwrap(),
             poll_interval_s: 480,
-            fresh: true,
-            stale_since: None,
             stale_reason: None,
             subscription_type: Some("max".into()),
             windows: vec![Window {

@@ -87,21 +87,12 @@ pub struct Snapshot {
     pub next_poll_at: Timestamp,
     /// The interval that produced this reading.
     pub poll_interval_s: u64,
-    /// False when the values below are the last known good ones carried forward
-    /// because the current poll could not read the API (expired token, outage).
-    /// The values are deliberately preserved rather than nulled — a stale number
-    /// plus an honest flag beats no number at all.
-    ///
-    /// Redundant with `updated_at`, which already dates the reading; kept only
-    /// until the consumers stop expecting it.
-    // TODO(snapshot-drop-fresh-stale-since)
-    pub fresh: bool,
-    /// Present only when `fresh` is false: when the carried-forward values were
-    /// actually read, and why they could not be refreshed. Duplicates
-    /// `updated_at` on every path that carries numbers.
-    // TODO(snapshot-drop-fresh-stale-since)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale_since: Option<Timestamp>,
+    /// Present, with a non-null string, exactly when the windows below are not
+    /// a reading taken for this publish: they are the last known good values
+    /// carried forward, and the string says why this publish could not take a
+    /// new one. When `windows` is empty it says why nothing has ever been read.
+    /// Absent on a fresh reading. Consumers derive "fresh" as this field being
+    /// absent; `updated_at` dates the values whether or not they are carried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,13 +195,26 @@ mod tests {
         let s: Snapshot = serde_json::from_str(
             r#"{"profile":"p","auth":"ok","updated_at":"1970-01-01T00:00:01Z",
                 "next_poll_at":"1970-01-01T00:00:02Z","poll_interval_s":480,
-                "fresh":true,"windows":[]}"#,
+                "windows":[]}"#,
         )
         .unwrap();
         assert_eq!(s.profile, "p");
         assert_eq!(s.auth, AuthState::Ok);
-        assert!(s.stale_since.is_none());
         assert!(s.stale_reason.is_none());
         assert!(s.subscription_type.is_none());
+    }
+
+    #[test]
+    fn snapshot_ignores_pre_0_2_fields() {
+        // A 0.1.0 daemon's retained snapshot still carries `fresh` and
+        // `stale_since`; a current client must decode it unchanged.
+        let s: Snapshot = serde_json::from_str(
+            r#"{"profile":"p","auth":"stale","updated_at":"1970-01-01T00:00:01Z",
+                "next_poll_at":"1970-01-01T00:00:02Z","poll_interval_s":480,
+                "fresh":false,"stale_since":"1970-01-01T00:00:01Z",
+                "stale_reason":"x","windows":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.stale_reason.as_deref(), Some("x"));
     }
 }

@@ -772,7 +772,7 @@ impl Daemon {
                     return self.stop_resync(connects, i, Some(&name), "window scalars", Some(&e));
                 }
                 if let Err(e) = self
-                    .publish_snapshot(i, now, false, Some("republished after broker reconnect"))
+                    .publish_snapshot(i, now, Some("republished after broker reconnect"))
                     .await
                 {
                     return self.stop_resync(connects, i, Some(&name), "snapshot", Some(&e));
@@ -1082,7 +1082,7 @@ impl Daemon {
             }
             _ => "no OAuth credentials for this profile",
         });
-        if let Err(e) = self.publish_snapshot(idx, now, false, Some(reason)).await {
+        if let Err(e) = self.publish_snapshot(idx, now, Some(reason)).await {
             let name = &self.profiles[idx].cfg.name;
             warn!(profile = %name, error = %e, "snapshot publish failed");
         }
@@ -1209,10 +1209,7 @@ impl Daemon {
                 // Carry the last known values forward flagged stale rather than
                 // publishing nothing: a retained tree that goes silent looks
                 // identical to one that is merely quiet.
-                if let Err(e2) = self
-                    .publish_snapshot(idx, now, false, Some(&e.to_string()))
-                    .await
-                {
+                if let Err(e2) = self.publish_snapshot(idx, now, Some(&e.to_string())).await {
                     warn!(profile = %name, error = %e2, "stale snapshot publish failed");
                 }
             }
@@ -1227,7 +1224,7 @@ impl Daemon {
 
     async fn publish_reading(&self, idx: usize, now: Timestamp, windows: &[Window]) -> Result<()> {
         self.publish_window_scalars(idx, windows).await?;
-        self.publish_snapshot(idx, now, true, None).await
+        self.publish_snapshot(idx, now, None).await
     }
 
     /// The per-window scalar topics. `claude-usage get` and the watchdog read
@@ -1260,10 +1257,9 @@ impl Daemon {
         &self,
         idx: usize,
         now: Timestamp,
-        fresh: bool,
         stale_reason: Option<&str>,
     ) -> Result<()> {
-        let Some(snap) = self.build_snapshot(idx, now, fresh, stale_reason) else {
+        let Some(snap) = self.build_snapshot(idx, now, stale_reason) else {
             return Ok(());
         };
         self.mqtt
@@ -1277,7 +1273,6 @@ impl Daemon {
         &self,
         idx: usize,
         now: Timestamp,
-        fresh: bool,
         stale_reason: Option<&str>,
     ) -> Option<Snapshot> {
         let p = &self.profiles[idx];
@@ -1306,9 +1301,9 @@ impl Daemon {
         let auth = wire_auth(auth);
 
         // The time of validity of what this payload asserts, never the time it
-        // was published. Derived from the data rather than from `fresh`: the
-        // time of a reading is `last_success_at` whichever path publishes it,
-        // and on a fresh publish the two are the same instant.
+        // was published. The time of a reading is `last_success_at` whichever
+        // path publishes it, and on a fresh publish the two are the same
+        // instant.
         let updated_at = if p.book.last_windows.is_empty() {
             now
         } else {
@@ -1332,8 +1327,6 @@ impl Daemon {
             updated_at,
             next_poll_at,
             poll_interval_s: interval,
-            fresh,
-            stale_since: if fresh { None } else { p.book.last_success_at },
             stale_reason: stale_reason.map(str::to_string),
             subscription_type: p.book.subscription_type.clone(),
             windows: p.book.last_windows.clone(),
@@ -2549,7 +2542,7 @@ mod tests {
     ///   resolved to a state.
     ///
     /// Either way, publishing writes an auth state nobody established and
-    /// `fresh: false` over a good retained snapshot — the two-topic
+    /// a stale reason over a good retained snapshot — the two-topic
     /// disagreement this rule exists to prevent.
     ///
     /// Counted through the stall, which is the only observable: the pass fits
@@ -2570,7 +2563,7 @@ mod tests {
         // arithmetic alone is also satisfied by skipping the snapshot and a
         // window scalar while still asserting an auth state nobody established.
         assert!(
-            d.build_snapshot(0, Timestamp::now(), false, None).is_none(),
+            d.build_snapshot(0, Timestamp::now(), None).is_none(),
             "an unclassified profile had a snapshot payload to publish"
         );
         assert_eq!(
@@ -2626,7 +2619,7 @@ mod tests {
             "a publish that never landed was recorded as published"
         );
         let snap = d
-            .build_snapshot(0, Timestamp::now(), true, None)
+            .build_snapshot(0, Timestamp::now(), None)
             .expect("a classified profile publishes");
         assert_eq!(
             snap.auth,
@@ -2707,7 +2700,7 @@ mod tests {
             "an unreadable read disturbed what the topic is known to carry"
         );
         let snap = d
-            .build_snapshot(0, Timestamp::now(), false, Some("unreadable"))
+            .build_snapshot(0, Timestamp::now(), Some("unreadable"))
             .expect("a profile classified before the unreadable read still publishes");
         assert_eq!(
             snap.auth,
@@ -2779,7 +2772,7 @@ mod tests {
         d.profiles[0].book.poll_interval_s = Some(60);
 
         let snap = d
-            .build_snapshot(0, now, false, Some("carried forward"))
+            .build_snapshot(0, now, Some("carried forward"))
             .expect("a classified profile publishes");
         assert_eq!(
             snap.next_poll_at.as_second(),
@@ -2791,6 +2784,7 @@ mod tests {
             snap.updated_at, hour_ago,
             "carried-forward numbers must keep their reading time"
         );
+        assert_eq!(snap.stale_reason.as_deref(), Some("carried forward"));
     }
 
     /// A profile with readings but no deadline — nothing to compute one from —
@@ -2803,7 +2797,7 @@ mod tests {
         d.profiles[0].retry_at = None;
 
         let snap = d
-            .build_snapshot(0, now, false, None)
+            .build_snapshot(0, now, None)
             .expect("a classified profile publishes");
         assert_eq!(snap.next_poll_at, now);
     }
@@ -2817,10 +2811,10 @@ mod tests {
         d.profiles[0].book.last_success_at = Some(now);
 
         let snap = d
-            .build_snapshot(0, now, true, None)
+            .build_snapshot(0, now, None)
             .expect("a classified profile publishes");
         assert_eq!(snap.updated_at, now);
-        assert!(snap.stale_since.is_none());
+        assert!(snap.stale_reason.is_none());
     }
 
     /// `last_windows` and `last_success_at` are independent fields of a retained
@@ -2834,7 +2828,7 @@ mod tests {
         d.profiles[0].book.last_success_at = None;
         assert!(!d.profiles[0].book.last_windows.is_empty());
 
-        let (snap, logs) = logged(|| d.build_snapshot(0, now, false, Some("carried forward")));
+        let (snap, logs) = logged(|| d.build_snapshot(0, now, Some("carried forward")));
         let snap = snap.expect("a classified profile publishes");
         assert_eq!(snap.updated_at, now);
         assert!(
@@ -2851,7 +2845,7 @@ mod tests {
         d.profiles[0].auth = None;
         assert!(!d.profiles[0].book.last_windows.is_empty());
 
-        assert!(d.build_snapshot(0, Timestamp::now(), false, None).is_none());
+        assert!(d.build_snapshot(0, Timestamp::now(), None).is_none());
     }
 
     /// The retry that turns a recorded resume point into an actual second

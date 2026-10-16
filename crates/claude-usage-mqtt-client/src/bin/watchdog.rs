@@ -118,7 +118,7 @@ impl WatchdogState {
             }
             Event::Snapshot(s) if self.profile_in_scope(&s.profile) => {
                 let mut out =
-                    self.snapshot_fresh(&s.profile, s.fresh, &s.stale_since, &s.stale_reason);
+                    self.snapshot_fresh(&s.profile, s.updated_at, s.stale_reason.as_deref());
                 for w in &s.windows {
                     if self.window_in_scope(&w.key) {
                         if let Some(at) = w.resets_at {
@@ -302,39 +302,32 @@ impl WatchdogState {
     fn snapshot_fresh(
         &mut self,
         profile: &str,
-        fresh: bool,
-        stale_since: &Option<Timestamp>,
-        stale_reason: &Option<String>,
+        updated_at: Timestamp,
+        stale_reason: Option<&str>,
     ) -> Vec<Value> {
         let was_stale = self.stale.get(profile).copied().unwrap_or(false);
-        let now_stale = !fresh;
+        let now_stale = stale_reason.is_some();
         if was_stale == now_stale {
             return Vec::new();
         }
         self.stale.insert(profile.to_string(), now_stale);
-        if now_stale {
-            let mut line = json!({
+        let line = match stale_reason {
+            Some(reason) => json!({
                 "type": "watchdog",
                 "state": "degraded",
                 "profile": profile,
                 "reason": "stale_data",
-            });
-            let obj = line.as_object_mut().unwrap();
-            if let Some(since) = stale_since {
-                obj.insert("stale_since".into(), json!(since.to_string()));
-            }
-            if let Some(reason) = stale_reason {
-                obj.insert("stale_reason".into(), json!(reason));
-            }
-            vec![line]
-        } else {
-            vec![json!({
+                "updated_at": updated_at.to_string(),
+                "stale_reason": reason,
+            }),
+            None => json!({
                 "type": "watchdog",
                 "state": "recovered",
                 "profile": profile,
                 "reason": "fresh_data",
-            })]
-        }
+            }),
+        };
+        vec![line]
     }
 }
 
@@ -526,12 +519,6 @@ mod tests {
             updated_at: Timestamp::from_second(1000).unwrap(),
             next_poll_at: Timestamp::from_second(1480).unwrap(),
             poll_interval_s: 480,
-            fresh,
-            stale_since: if fresh {
-                None
-            } else {
-                Some(Timestamp::from_second(500).unwrap())
-            },
             stale_reason: if fresh {
                 None
             } else {
@@ -553,13 +540,23 @@ mod tests {
         let out = s.on_event(&snapshot("default", false));
         // A stale-data degraded line plus an armed line plus an alert (a stale 95
         // is still worth alerting), and the alert echoes resets_at.
-        assert!(out.iter().any(|l| l["reason"] == "stale_data"));
+        let stale = out.iter().find(|l| l["reason"] == "stale_data").unwrap();
+        assert_eq!(
+            stale["updated_at"],
+            Timestamp::from_second(1000).unwrap().to_string()
+        );
+        assert_eq!(stale["stale_reason"], "token expired");
+        assert!(stale.get("stale_since").is_none(), "{stale}");
         assert!(out.iter().any(|l| l["state"] == "armed"));
         let alert = out.iter().find(|l| line_type(l) == "usage_alert").unwrap();
         assert!(alert["resets_at"].is_string());
         // Back to fresh -> recovered.
         let out = s.on_event(&snapshot("default", true));
-        assert!(out.iter().any(|l| l["reason"] == "fresh_data"));
+        let fresh = out.iter().find(|l| l["reason"] == "fresh_data").unwrap();
+        assert!(
+            fresh.get("stale_reason").is_none() && fresh.get("updated_at").is_none(),
+            "{fresh}"
+        );
     }
 
     #[test]

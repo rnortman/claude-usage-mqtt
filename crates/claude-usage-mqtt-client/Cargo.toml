@@ -19,7 +19,7 @@ name = "claude-usage"
 path = "src/bin/claude-usage.rs"
 
 [dependencies]
-claude-usage-mqtt-core = { version = "0.1.0", path = "../claude-usage-mqtt-core" }
+claude-usage-mqtt-core = { version = "0.2.0", path = "../claude-usage-mqtt-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 jiff = { workspace = true }

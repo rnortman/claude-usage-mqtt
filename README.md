@@ -35,7 +35,7 @@ API.
 If the refresh does not produce a usable token — the refresh token is dead too,
 the CLI is not installed, `[refresh]` is turned off — nothing is papered over:
 the profile publishes `auth = stale` and keeps serving the last known values
-flagged `fresh: false` until a human logs in again. Attempts are rate-limited per
+flagged with a `stale_reason` until a human logs in again. Attempts are rate-limited per
 profile (`refresh.min_interval_s`) and capped at one per tick, so a profile that
 cannot heal costs one subprocess every 15 minutes rather than one per tick, and a
 host that wakes with every profile expired heals them one tick at a time instead
@@ -111,7 +111,6 @@ limits, so subscribe with a wildcard rather than hardcoding the list.
   "updated_at": "2026-07-17T13:51:42Z",
   "next_poll_at": "2026-07-17T13:59:42Z",
   "poll_interval_s": 480,
-  "fresh": true,
   "subscription_type": "max",
   "windows": [
     {"key":"five_hour","label":"5-hour","utilization":42.5,"resets_at":"2026-07-17T18:51:42Z"},
@@ -134,10 +133,18 @@ exist. `next_poll_at` is the one forward-looking field: the profile's *deadline*
 contention the actual poll can be later, and a `next_poll_at` in the past means
 "overdue, waiting for a slot"; judge staleness by `updated_at`.
 
-When `fresh` is `false`, the windows are the last known
-good values carried forward, and `stale_reason` / `stale_since` say why and since
-when. Values are deliberately preserved rather than nulled: a real number with an
-honest stale flag beats no number.
+"Are these numbers a reading taken for this publish?" is `stale_reason` absent.
+When `stale_reason` is present, the windows are the last known good values carried
+forward, `updated_at` is when they were read, and the string says why this
+publish could not take a new one. With no windows, the string says why nothing
+has ever been read and `updated_at` is when that error was observed — not a
+reading time. Values are deliberately preserved rather than nulled: a real number
+with an honest reason beats no number.
+
+`fresh` and `stale_since` were removed in 0.2.0: `fresh` is `stale_reason`
+absent, and `stale_since` duplicated `updated_at`. Deploy 0.2.0 `claude-usage`
+and `watchdog` before the 0.2.0 daemon — a 0.1.0 client cannot decode a 0.2.0
+snapshot, while a 0.2.0 client reads a 0.1.0 snapshot unchanged.
 
 The `auth` value distinguishes four states, each with a different fix:
 
@@ -386,6 +393,8 @@ this workspace share the daemon's own definitions:
   {"type":"usage_alert","profile":"default","window":"five_hour","utilization":94.2,"threshold":94,"resets_at":"2026-07-18T21:00:00Z"}
   {"type":"usage_reset","profile":"default","boundary":"2026-07-18T21:00:00Z","source":"api","fired_at":"..."}
   {"type":"watchdog","state":"degraded","reason":"daemon_offline"}
+  {"type":"watchdog","state":"degraded","profile":"default","reason":"stale_data","updated_at":"2026-07-18T16:12:00Z","stale_reason":"..."}
+  {"type":"watchdog","state":"recovered","profile":"default","reason":"fresh_data"}
   ```
 
   An `armed` line confirms the watchdog is live once the first reading for each
@@ -397,8 +406,11 @@ this workspace share the daemon's own definitions:
   when utilization drops below half of the last alerted value (`source`
   `inferred`, no `boundary`). `degraded`/`recovered` lines are edge-triggered
   from broker facts: daemon offline (LWT), a profile's auth leaving `ok`, or a
-  snapshot going stale (`fresh:false`); stale readings still feed the alert
-  rule.
+  snapshot going stale (`stale_reason` present); stale readings still feed the alert
+  rule. A `stale_data` line carries the snapshot's `updated_at` and its
+  `stale_reason`; `updated_at` keeps its payload meaning — when the carried
+  values were read, or, for a profile with no reading at all, when the error was
+  observed.
 
 ### Running multiple logins: `claude-profile`
 

@@ -21,6 +21,23 @@ fn ts(v: &serde_json::Value) -> jiff::Timestamp {
         .expect("parsing a published timestamp")
 }
 
+/// Assert a snapshot is a fresh reading: no `stale_reason` key.
+#[track_caller]
+fn assert_fresh(snap: &serde_json::Value) {
+    assert!(
+        snap.get("stale_reason").is_none(),
+        "fresh reading flagged stale: {snap}"
+    );
+}
+
+/// Assert a snapshot is flagged stale and return its `stale_reason`.
+#[track_caller]
+fn assert_stale(snap: &serde_json::Value) -> &str {
+    snap["stale_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("snapshot not flagged stale: {snap}"))
+}
+
 /// A healthy poll publishes scalars, a snapshot, and liveness.
 #[tokio::test]
 async fn healthy_poll_publishes_the_whole_tree() {
@@ -53,7 +70,11 @@ async fn healthy_poll_publishes_the_whole_tree() {
     );
 
     let snap = col.json("t1/profile/live/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], true);
+    assert_fresh(&snap);
+    assert!(
+        snap.get("fresh").is_none() && snap.get("stale_since").is_none(),
+        "removed 0.1.0 keys reappeared: {snap}"
+    );
     assert_eq!(snap["auth"], "ok");
     assert_eq!(snap["subscription_type"], "max");
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
@@ -251,7 +272,7 @@ async fn a_restart_leaves_the_last_known_values_standing() {
 
     let snap = col.json("t8/profile/live/snapshot").expect("snapshot");
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
-    assert_eq!(snap["fresh"], true);
+    assert_fresh(&snap);
     assert!(
         ts(&snap["updated_at"]) < restart_at,
         "updated_at must date the reading, not the restart"
@@ -281,9 +302,8 @@ async fn an_expired_profile_reports_stale_without_spending_an_api_call() {
 
     assert_eq!(col.last("t9/profile/stale/auth").as_deref(), Some("stale"));
     let snap = col.json("t9/profile/stale/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], false);
     assert!(
-        snap["stale_reason"].as_str().unwrap().contains("expired"),
+        assert_stale(&snap).contains("expired"),
         "reason should name the actual problem: {snap:?}"
     );
     assert_eq!(
@@ -326,7 +346,7 @@ async fn a_stale_profile_is_refreshed_by_the_cli_and_then_polled() {
         "an expired profile the CLI can renew must not stay stale"
     );
     let snap = col.json("t33/profile/stale/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], true, "healed profile published no reading");
+    assert_fresh(&snap);
     assert_eq!(
         mock.call_count().await,
         1,
@@ -355,8 +375,7 @@ async fn a_failed_refresh_publishes_stale_with_the_advice_that_is_left() {
 
     assert_eq!(col.last("t35/profile/stale/auth").as_deref(), Some("stale"));
     let snap = col.json("t35/profile/stale/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], false);
-    let reason = snap["stale_reason"].as_str().unwrap();
+    let reason = assert_stale(&snap);
     assert!(
         reason.contains("did not renew") && reason.contains("re-login"),
         "reason should say the refresh was tried and failed: {reason:?}"
@@ -417,10 +436,7 @@ async fn a_never_logged_in_profile_reports_missing_without_spending_an_api_call(
     let snap = col.json("t16/profile/nologin/snapshot").expect("snapshot");
     assert_eq!(snap["auth"], "missing");
     assert!(
-        snap["stale_reason"]
-            .as_str()
-            .unwrap()
-            .contains("credentials"),
+        assert_stale(&snap).contains("credentials"),
         "reason should name missing credentials: {snap:?}"
     );
     assert_eq!(
@@ -514,7 +530,7 @@ async fn a_never_polled_profile_is_served_before_a_rehydrated_one() {
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
     assert_eq!(mock.call_count().await, 1);
     let a_first = col.json("t24/profile/a/snapshot").expect("a polled first");
-    assert_eq!(a_first["fresh"], true);
+    assert_fresh(&a_first);
     assert!(col.json("t24/profile/b/snapshot").is_none());
     assert_eq!(col.last("t24/profile/b/auth").as_deref(), Some("ok"));
 
@@ -571,7 +587,7 @@ async fn a_restart_within_the_global_spacing_makes_no_call() {
         "a restart republished a snapshot for a profile it had not classified"
     );
     let snap = col.json("t25/profile/live/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], true);
+    assert_fresh(&snap);
     assert_eq!(snap["updated_at"], before["updated_at"]);
 }
 
@@ -647,7 +663,7 @@ async fn a_carried_forward_snapshot_reports_the_original_reading_time() {
     let col = Collector::start(broker.port, "t47", "col-t47").await;
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
     let first = col.json("t47/profile/live/snapshot").expect("snapshot");
-    assert_eq!(first["fresh"], true);
+    assert_fresh(&first);
 
     // Fail the next poll so the earlier values are carried forward.
     mock.set_mode(Mode::Garbage);
@@ -655,13 +671,12 @@ async fn a_carried_forward_snapshot_reports_the_original_reading_time() {
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
 
     let snap = col.json("t47/profile/live/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], false);
+    assert_stale(&snap);
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
     assert_eq!(
         snap["updated_at"], first["updated_at"],
         "a republish moved updated_at forward, making old numbers look current"
     );
-    assert_eq!(snap["stale_since"], first["updated_at"]);
 }
 
 /// The other carry-forward path: a profile that polled fine and then had its
@@ -680,7 +695,7 @@ async fn a_drained_profile_keeps_the_reading_time_of_its_last_poll() {
     let col = Collector::start(broker.port, "t49", "col-t49").await;
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
     let first = col.json("t49/profile/live/snapshot").expect("snapshot");
-    assert_eq!(first["fresh"], true);
+    assert_fresh(&first);
     assert_eq!(mock.call_count().await, 1);
 
     // The token expires between runs: the profile is now drained rather than
@@ -692,7 +707,7 @@ async fn a_drained_profile_keeps_the_reading_time_of_its_last_poll() {
     assert_eq!(mock.call_count().await, 1, "an expired token was spent");
     let snap = col.json("t49/profile/live/snapshot").expect("snapshot");
     assert_eq!(snap["auth"], "stale");
-    assert_eq!(snap["fresh"], false);
+    assert_stale(&snap);
     assert_eq!(
         snap["windows"].as_array().unwrap().len(),
         3,
@@ -726,12 +741,8 @@ async fn an_error_only_snapshot_reports_when_the_error_was_observed() {
     assert_eq!(mock.call_count().await, 0, "an expired token was spent");
     let snap = col.json("t48/profile/dead/snapshot").expect("snapshot");
     assert_eq!(snap["auth"], "stale");
-    assert_eq!(snap["fresh"], false);
+    assert_stale(&snap);
     assert!(snap["windows"].as_array().unwrap().is_empty());
-    assert!(
-        snap["stale_since"].is_null(),
-        "nothing was ever read, so there is no stale_since: {snap:?}"
-    );
     let at = ts(&snap["updated_at"]).as_second();
     assert!(
         (started..=finished).contains(&at),
@@ -865,7 +876,7 @@ async fn reload_applies_a_new_config_without_a_process_exit() {
     let (sup, ctl) = spawn_supervisor(&cfg, &mock.endpoint()).await;
     tokio::time::sleep(Duration::from_secs_f64(1.5)).await;
     assert_eq!(mock.call_count().await, 1);
-    assert_eq!(col.json("t28/profile/a/snapshot").unwrap()["fresh"], true);
+    assert_fresh(&col.json("t28/profile/a/snapshot").unwrap());
 
     // Same file, now with a second profile.
     write_config(dir.path(), broker.port, "t28", 60, &[("a", a), ("b", b)]);
@@ -882,11 +893,8 @@ async fn reload_applies_a_new_config_without_a_process_exit() {
         1,
         "the reload republished a's snapshot without having polled a"
     );
-    assert_eq!(
-        col.json("t28/profile/a/snapshot").unwrap()["fresh"],
-        true,
-        "a's reading survived the in-process restart untouched"
-    );
+    // a's reading survived the in-process restart untouched.
+    assert_fresh(&col.json("t28/profile/a/snapshot").unwrap());
     assert_eq!(
         mock.call_count().await,
         1,
@@ -967,7 +975,7 @@ async fn a_broker_outage_pauses_the_daemon_and_a_reconnect_re_announces_online()
     tokio::time::sleep(Duration::from_secs_f64(1.5)).await;
     assert_eq!(mock.call_count().await, 1);
     let before = col.json("t29/profile/a/snapshot").unwrap();
-    assert_eq!(before["fresh"], true);
+    assert_fresh(&before);
     assert_eq!(col.count("t29/profile/a/reset/ping"), 0, "not due yet");
     drop(col);
 
@@ -1219,7 +1227,7 @@ async fn a_rate_limit_widens_spacing_and_preserves_values() {
     assert_eq!(t["rate_limit_hits"], 1);
 
     let snap = col.json("t12/profile/live/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], false);
+    assert_stale(&snap);
     // The reading is old, but nulling it would be strictly worse than an honest
     // stale flag on a real number.
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
@@ -1250,7 +1258,7 @@ async fn a_shape_change_does_not_widen_spacing_or_blank_values() {
         "a shape change is not a rate-limit signal"
     );
     let snap = col.json("t13/profile/live/snapshot").expect("snapshot");
-    assert_eq!(snap["fresh"], false);
+    assert_stale(&snap);
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
 }
 
@@ -1281,7 +1289,7 @@ async fn a_rejected_token_reports_rejected_with_a_reason() {
         "the snapshot must carry the same classification as the auth topic: {snap:?}"
     );
     assert!(
-        snap["stale_reason"].as_str().unwrap().contains("reject"),
+        assert_stale(&snap).contains("reject"),
         "reason should name the rejection: {snap:?}"
     );
     assert_eq!(mock.call_count().await, 1, "one discovery call, no more");
