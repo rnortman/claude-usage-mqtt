@@ -7,14 +7,15 @@
 
 use std::collections::BTreeSet;
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use claude_usage_mqtt_client::{ClientConfig, Event, UsageClient};
+use claude_usage_mqtt_client::{ClientConfig, ClientError, Event, UsageClient};
 use claude_usage_mqtt_core::{
-    AuthState, NextResetPayload, ResetPingPayload, Snapshot, Source, ThrottlePayload, Topics,
-    Window,
+    AuthState, KEEP_ALIVE_RANGE_S, NextResetPayload, PASSWORD_ENV, ResetPingPayload, Snapshot,
+    Source, ThrottlePayload, Topics, Window,
 };
 use jiff::Timestamp;
 use rumqttc::v5::mqttbytes::QoS;
@@ -192,6 +193,7 @@ fn client_config(port: u16) -> ClientConfig {
         password: None,
         topic_prefix: "claude/usage".into(),
         client_id: format!("test-client-{}", free_port()),
+        keep_alive_s: 60,
     }
 }
 
@@ -511,29 +513,71 @@ async fn connect_to_closed_port_fails_fast() {
     }
 }
 
-/// Run the built `claude-usage` binary against the test broker.
-async fn run_cli(port: u16, args: &[&str]) -> std::process::Output {
-    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_claude-usage"))
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--tls")
-            .arg("false")
-            .args(&owned)
-            .output()
-            .expect("run claude-usage")
-    })
-    .await
-    .expect("join claude-usage")
+#[tokio::test]
+async fn connect_validates_keep_alive_range() {
+    // Validated before any network I/O, so no broker is needed: out-of-range
+    // values fail with `InvalidConfig`, and the range's own ends get past the
+    // check to the connect attempt, which fails on the closed port.
+    let (lo, hi) = (*KEEP_ALIVE_RANGE_S.start(), *KEEP_ALIVE_RANGE_S.end());
+    for bad in [lo - 1, hi + 1] {
+        let cfg = ClientConfig {
+            keep_alive_s: bad,
+            ..client_config(free_port())
+        };
+        match UsageClient::connect(cfg).await {
+            Err(ClientError::InvalidConfig(msg)) => {
+                assert!(msg.contains("keep_alive_s"), "{msg}")
+            }
+            Err(e) => panic!("keep_alive_s={bad}: wrong error variant: {e}"),
+            Ok(_) => panic!("keep_alive_s={bad}: connect accepted it"),
+        }
+    }
+    for good in [lo, hi] {
+        let cfg = ClientConfig {
+            keep_alive_s: good,
+            ..client_config(free_port())
+        };
+        let res = tokio::time::timeout(Duration::from_secs(5), UsageClient::connect(cfg)).await;
+        match res.expect("connect hung instead of failing fast") {
+            Err(ClientError::Connect(_)) => {}
+            Err(e) => panic!("keep_alive_s={good}: wrong error variant: {e}"),
+            Ok(_) => panic!("keep_alive_s={good}: connected to a closed port"),
+        }
+    }
 }
 
-/// Run the built `claude-usage` binary with an explicit environment, so the
-/// profile default is exercised through `current_profile()` (child-process env,
-/// no test-process env race). `CLAUDE_CONFIG_DIR`/`CLAUDE_PROFILES_DIR` are set
-/// from `env`; both are cleared first so an inherited value cannot leak in.
+/// A `claude-usage` command in a hermetic environment. `HOME` is `home` — a
+/// per-test tempdir, so the developer's own ~/.config/claude-usage-mqtt is
+/// invisible to the child — and the password and profile env vars are cleared
+/// so nothing from the test process's environment leaks in. Callers that want
+/// a profile env set it on the returned command.
+fn hermetic_cli(home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude-usage"));
+    cmd.env("HOME", home)
+        .env_remove(PASSWORD_ENV)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_PROFILES_DIR");
+    cmd
+}
+
+/// Point a command at the test broker by flags (`--host/--port/--tls false`).
+fn with_broker_flags(cmd: &mut Command, port: u16) -> &mut Command {
+    cmd.arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--tls")
+        .arg("false")
+}
+
+/// Run the built `claude-usage` binary against the test broker.
+async fn run_cli(port: u16, args: &[&str]) -> std::process::Output {
+    run_cli_env(port, args, &[]).await
+}
+
+/// Run the built `claude-usage` binary against the test broker with extra env
+/// vars, so the profile default is exercised through `current_profile()`
+/// (child-process env, no test-process env race).
 async fn run_cli_env(port: u16, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let owned_env: Vec<(String, String)> = env
@@ -541,15 +585,9 @@ async fn run_cli_env(port: u16, args: &[&str], env: &[(&str, &str)]) -> std::pro
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude-usage"));
-        cmd.arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--tls")
-            .arg("false")
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .env_remove("CLAUDE_PROFILES_DIR");
+        let home = tempfile::tempdir().expect("tempdir for HOME");
+        let mut cmd = hermetic_cli(home.path());
+        with_broker_flags(&mut cmd, port);
         for (k, v) in &owned_env {
             cmd.env(k, v);
         }
@@ -680,17 +718,12 @@ async fn cli_watchdog_emits_armed_alert_and_reset_lines() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Spawn the long-running watchdog with stdout piped.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-usage"))
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(broker.port.to_string())
-        .arg("--tls")
-        .arg("false")
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = hermetic_cli(home.path());
+    let mut child = with_broker_flags(&mut cmd, broker.port)
         .args(["--profile", "personal", "watchdog"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn watchdog");
 
@@ -726,23 +759,117 @@ async fn cli_watchdog_emits_armed_alert_and_reset_lines() {
     child.kill().unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
 
     let types: Vec<&str> = stdout.lines().collect();
     assert!(
         types.iter().any(|l| l.contains("\"state\":\"armed\"")),
-        "expected an armed line: {stdout}"
+        "expected an armed line: {stdout}\nstderr: {stderr}"
     );
     assert!(
         types
             .iter()
             .any(|l| l.contains("\"type\":\"usage_alert\"") && l.contains("95.0")),
-        "expected a 95% alert: {stdout}"
+        "expected a 95% alert: {stdout}\nstderr: {stderr}"
     );
     assert!(
         types
             .iter()
             .any(|l| l.contains("\"type\":\"usage_reset\"") && l.contains("\"source\":\"api\"")),
-        "expected a reset line: {stdout}"
+        "expected a reset line: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn cli_discovers_daemon_config_from_home() {
+    // Zero flags: host, port, TLS, prefix and keep-alive all come from the
+    // daemon-shape config.toml under the child's HOME. Without discovery the
+    // client would dial localhost:8883 over TLS under `claude/usage` and fail.
+    let broker = broker_or_skip!();
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = home.path().join(".config/claude-usage-mqtt");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        format!(
+            r#"[mqtt]
+host = "127.0.0.1"
+port = {port}
+tls = false
+topic_prefix = "e2e/discovered"
+keep_alive_s = 7
+
+[poll]
+min_api_interval_s = 60
+
+[[profile]]
+name = "personal"
+config_dir = "~/.claude"
+"#,
+            port = broker.port
+        ),
+    )
+    .unwrap();
+
+    let pubc = publisher(broker.port).await;
+    pubc.publish(
+        Topics::new("e2e/discovered").window_utilization("personal", "five_hour"),
+        QoS::AtLeastOnce,
+        true,
+        "42.5",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let home_path = home.path().to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        hermetic_cli(&home_path)
+            .args(["--profile", "personal", "get", "five_hour"])
+            .output()
+            .expect("run claude-usage")
+    })
+    .await
+    .expect("join claude-usage");
+    assert!(
+        out.status.success(),
+        "get should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42.5");
+
+    // The file's keep_alive_s reached the CONNECT packet: mosquitto logs it as
+    // `k<seconds>` on the client's connect line.
+    let log = std::fs::read_to_string(broker._dir.path().join("mosquitto.log")).unwrap();
+    let connected: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("New client connected"))
+        .collect();
+    assert!(
+        connected
+            .iter()
+            .any(|l| l.contains(" as claude-usage-") && l.contains("k7")),
+        "expected the CLI to connect with keep-alive 7; connect lines: {connected:#?}"
+    );
+}
+
+#[test]
+fn cli_missing_explicit_config_exits_1() {
+    // An explicit --config that does not exist is a config error, reported
+    // before any broker work.
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("nope.toml");
+    let out = hermetic_cli(home.path())
+        .arg("--config")
+        .arg(&missing)
+        .args(["--profile", "personal", "snapshot"])
+        .output()
+        .expect("run claude-usage");
+    assert_eq!(out.status.code(), Some(1), "missing config should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "error should say the file does not exist: {stderr}"
     );
 }
 

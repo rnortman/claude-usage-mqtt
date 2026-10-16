@@ -99,7 +99,10 @@ fn parse_client_file(path: &Path) -> Result<MqttConfig> {
     let text = read(path)?;
     let parsed: ClientFileConfig =
         toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))?;
-    parsed.mqtt.validate()?;
+    parsed
+        .mqtt
+        .validate()
+        .with_context(|| format!("invalid [mqtt] section in {}", path.display()))?;
     Ok(normalize(parsed.mqtt))
 }
 
@@ -126,7 +129,8 @@ fn parse_daemon_file(path: &Path) -> Result<MqttConfig> {
         .clone()
         .try_into()
         .with_context(|| format!("parsing [mqtt] section in {}", path.display()))?;
-    mqtt.validate()?;
+    mqtt.validate()
+        .with_context(|| format!("invalid [mqtt] section in {}", path.display()))?;
     Ok(normalize(mqtt))
 }
 
@@ -298,7 +302,7 @@ config_dir = "~/.claude"
             "client.toml",
             "[mqtt]\nhost = \"h\"\ntopic_prefix = \"\"\n",
         );
-        let err = parse_client_file(&p).unwrap_err().to_string();
+        let err = format!("{:#}", parse_client_file(&p).unwrap_err());
         assert!(err.contains("must not be empty"), "unexpected: {err}");
     }
 
@@ -347,7 +351,18 @@ config_dir = "~/.claude"
             "client.toml",
             "[mqtt]\nhost = \"h\"\ntopic_prefix = \"a/#\"\n",
         );
-        let err = parse_client_file(&p).unwrap_err().to_string();
+        let err = format!("{:#}", parse_client_file(&p).unwrap_err());
         assert!(err.contains("wildcards"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn invalid_mqtt_section_error_names_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["client.toml", "config.toml"] {
+            let p = write(d.path(), name, "[mqtt]\nhost = \"h\"\nkeep_alive_s = 3\n");
+            let err = format!("{:#}", parse_any(&p).unwrap_err());
+            assert!(err.contains(&p.display().to_string()), "unexpected: {err}");
+            assert!(err.contains("mqtt.keep_alive_s"), "unexpected: {err}");
+        }
     }
 }

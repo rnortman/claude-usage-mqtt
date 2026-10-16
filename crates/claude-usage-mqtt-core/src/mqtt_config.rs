@@ -6,11 +6,30 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// Secrets never live in the config file. The password is read from either this
 /// env var or a separate file, so the config can be committed / synced.
 pub const PASSWORD_ENV: &str = "CLAUDE_USAGE_MQTT_PASSWORD";
+
+/// The keep-alive values the MQTT client can honor: it panics below the floor,
+/// and the CONNECT field is 16 bits, so anything above is silently truncated.
+pub const KEEP_ALIVE_RANGE_S: RangeInclusive<u64> = 5..=u16::MAX as u64;
+
+/// Check a keep-alive against [`KEEP_ALIVE_RANGE_S`]. The one rule both the
+/// config loader and `UsageClient::connect` apply; the message names the key.
+pub fn check_keep_alive(secs: u64) -> std::result::Result<(), String> {
+    if KEEP_ALIVE_RANGE_S.contains(&secs) {
+        Ok(())
+    } else {
+        Err(format!(
+            "keep_alive_s must be between {} and {} (got {secs})",
+            KEEP_ALIVE_RANGE_S.start(),
+            KEEP_ALIVE_RANGE_S.end()
+        ))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,9 +70,10 @@ fn default_keep_alive() -> u64 {
 }
 
 impl MqttConfig {
-    /// Reject a `topic_prefix` the broker could never accept as a publish root:
-    /// empty, or carrying MQTT wildcards. Called by the daemon's `Config::validate`
-    /// and by the client on every config file it loads.
+    /// Reject a `topic_prefix` the broker could never accept as a publish root
+    /// (empty, or carrying MQTT wildcards) and a `keep_alive_s` outside
+    /// [`KEEP_ALIVE_RANGE_S`] — a config error naming the key beats a panic or
+    /// a silently truncated keep-alive at connect.
     pub fn validate(&self) -> Result<()> {
         if self.topic_prefix.is_empty() {
             bail!("mqtt.topic_prefix must not be empty");
@@ -63,6 +83,9 @@ impl MqttConfig {
                 "mqtt.topic_prefix {:?} must not contain wildcards",
                 self.topic_prefix
             );
+        }
+        if let Err(msg) = check_keep_alive(self.keep_alive_s) {
+            bail!("mqtt.{msg}");
         }
         Ok(())
     }
@@ -211,6 +234,22 @@ mod tests {
             err.contains("must not contain wildcards"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_keep_alive() {
+        for bad in [0, 4, 65536] {
+            let err = mqtt(&format!("host = \"b\"\nkeep_alive_s = {bad}\n"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("mqtt.keep_alive_s"), "unexpected: {err}");
+        }
+        for good in [5, 65535] {
+            mqtt(&format!("host = \"b\"\nkeep_alive_s = {good}\n"))
+                .validate()
+                .unwrap();
+        }
     }
 
     #[test]

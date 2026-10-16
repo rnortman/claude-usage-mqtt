@@ -144,8 +144,6 @@ enum Command {
 /// never taken from the file — reusing the daemon's id would evict the running
 /// daemon from the broker — and the password comes only from the env var or the
 /// file's `password_file` (never a flag: flags are visible in `ps`).
-// TODO(cli-config-e2e): the merge below is unit-covered only; an e2e test
-// driving this binary with a real config file is deferred.
 fn config_from(cli: &Cli) -> anyhow::Result<ClientConfig> {
     let mut cfg = ClientConfig::default();
 
@@ -155,6 +153,7 @@ fn config_from(cli: &Cli) -> anyhow::Result<ClientConfig> {
         cfg.tls = mqtt.tls;
         cfg.username = mqtt.username;
         cfg.topic_prefix = mqtt.topic_prefix;
+        cfg.keep_alive_s = mqtt.keep_alive_s;
         // `load_client_config` already tilde-expanded `password_file`.
         cfg.password = resolve_password(mqtt.password_file.as_deref())?;
     } else {
@@ -451,6 +450,31 @@ mod tests {
         assert_eq!(cfg.port, 8883);
         assert!(cfg.tls);
         assert_eq!(cfg.topic_prefix, "claude/usage");
+        assert_eq!(cfg.keep_alive_s, 60);
+    }
+
+    #[test]
+    fn keep_alive_from_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = write_client(d.path(), "[mqtt]\nhost = \"h\"\nkeep_alive_s = 7\n");
+        let cli = parse(&["--config", p.to_str().unwrap()]);
+        let cfg = config_from(&cli).unwrap();
+        assert_eq!(cfg.keep_alive_s, 7);
+    }
+
+    #[test]
+    fn builtin_defaults_match_file_defaults() {
+        // A run with no file and a file that omits every optional field must
+        // resolve to the same connection settings.
+        let d = tempfile::tempdir().unwrap();
+        let p = write_client(d.path(), "[mqtt]\nhost = \"h\"\n");
+        let cli = parse(&["--config", p.to_str().unwrap()]);
+        let from_file = config_from(&cli).unwrap();
+        let builtin = ClientConfig::default();
+        assert_eq!(builtin.port, from_file.port);
+        assert_eq!(builtin.tls, from_file.tls);
+        assert_eq!(builtin.topic_prefix, from_file.topic_prefix);
+        assert_eq!(builtin.keep_alive_s, from_file.keep_alive_s);
     }
 
     #[test]

@@ -8,7 +8,9 @@ mod payloads;
 mod topics;
 mod window;
 
-pub use mqtt_config::{MqttConfig, PASSWORD_ENV, expand_tilde, resolve_password};
+pub use mqtt_config::{
+    KEEP_ALIVE_RANGE_S, MqttConfig, PASSWORD_ENV, check_keep_alive, expand_tilde, resolve_password,
+};
 
 pub use payloads::{
     AuthState, NextResetPayload, ResetPingPayload, Snapshot, Source, ThrottlePayload,

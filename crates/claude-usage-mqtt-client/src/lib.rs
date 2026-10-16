@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use claude_usage_mqtt_core::{
     AuthState, NextResetPayload, ParsedTopic, ResetPingPayload, Snapshot, ThrottlePayload, Topics,
+    check_keep_alive,
 };
 use jiff::Timestamp;
 use rumqttc::Transport;
@@ -22,8 +23,8 @@ use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event as MqttEvent, Incoming, MqttOptions};
 use tokio::sync::mpsc;
 
-/// How to reach the broker. The password is never a field here — the CLI reads
-/// it from the environment so it cannot leak through `ps`.
+/// How to reach the broker. `password` is the resolved secret, never a file
+/// path.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub host: String,
@@ -33,6 +34,10 @@ pub struct ClientConfig {
     pub password: Option<String>,
     pub topic_prefix: String,
     pub client_id: String,
+    /// Seconds between keep-alive pings when idle; the shared `[mqtt].keep_alive_s`.
+    /// Must lie in [`claude_usage_mqtt_core::KEEP_ALIVE_RANGE_S`]; `connect`
+    /// rejects anything outside it with [`ClientError::InvalidConfig`].
+    pub keep_alive_s: u64,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +50,7 @@ impl Default for ClientConfig {
             password: None,
             topic_prefix: "claude/usage".to_string(),
             client_id: default_client_id(),
+            keep_alive_s: 60,
         }
     }
 }
@@ -97,6 +103,9 @@ pub enum ClientError {
     Connect(Box<rumqttc::v5::ConnectionError>),
     #[error("connection closed")]
     Closed,
+    /// A `ClientConfig` field is out of range; nothing was sent to the broker.
+    #[error("invalid client config: {0}")]
+    InvalidConfig(String),
     /// A known topic carried a payload that would not decode. Skippable by the
     /// caller — retained state can outlive the schema that wrote it — never a
     /// stream-ending failure.
@@ -131,11 +140,14 @@ impl Drop for UsageClient {
 impl UsageClient {
     /// Connect and subscribe to the whole prefix. Retained values begin arriving
     /// immediately.
-    // TODO(unify-mqtt-connect): this rumqttc setup duplicates the daemon's in
-    // mqtt.rs; the config is shared but the connect path is not.
+    // These option setters mirror the daemon's `client_options` in
+    // `crates/claude-usage-mqtt/src/mqtt.rs` and stay separate on purpose: core
+    // is network-free, and everything from `AsyncClient::new` on differs between
+    // the two binaries by design.
     pub async fn connect(cfg: ClientConfig) -> Result<Self, ClientError> {
+        check_keep_alive(cfg.keep_alive_s).map_err(ClientError::InvalidConfig)?;
         let mut opts = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
-        opts.set_keep_alive(Duration::from_secs(30));
+        opts.set_keep_alive(Duration::from_secs(cfg.keep_alive_s));
         opts.set_clean_start(true);
         if let Some(user) = &cfg.username {
             opts.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());

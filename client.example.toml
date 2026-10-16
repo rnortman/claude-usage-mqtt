@@ -21,3 +21,4 @@ username = "claude-usage"
 # password_file = "~/.config/claude-usage-mqtt/mqtt.pass"
 
 topic_prefix = "claude/usage"
+# keep_alive_s = 60
