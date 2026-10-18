@@ -4,6 +4,8 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-18
+
 - **Breaking** (payload, version 0.2.0): the per-profile snapshot topic
   (`profile/<name>/snapshot`) no longer carries `fresh` or `stale_since`.
   A reading is current when `stale_reason` is absent; when it is present, the
