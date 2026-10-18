@@ -5,6 +5,9 @@
 //! retained values reaching late subscribers, restarts not costing API calls,
 //! the reset ping being time-driven, and stale data being preserved rather than
 //! nulled. Unit tests cannot reach any of those.
+//!
+//! TODO(flaky-daemon-e2e): one test in this suite failed intermittently; which
+//! one is not yet known.
 
 #[macro_use]
 mod harness;
