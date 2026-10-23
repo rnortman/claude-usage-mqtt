@@ -4,17 +4,106 @@ Polls Claude Code's usage windows for one or more login profiles and publishes
 them to MQTT, so anything on the network can see how much headroom each account
 has and get a ping when a 5-hour window resets.
 
-It is the `usage-watchdog` idea from the
-[`review-chain`](https://github.com/rnortman/claude-plugins/tree/main/plugins/review-chain)
-plugin, generalized: multiple profiles instead of one session's, a broker
-instead of stdout, and a throttle that assumes the API's rate limit is
-stricter than we can see.
+This is designed to feed into the [Brenn](https://github.com/rnortman/brenn)
+ecosystem, but can also feed anything that speaks MQTT, such as home automation.
+The [`ccc`](https://github.com/rnortman/ccc) harness uses the data here to
+choose which profile to run agents and subagents on in each invocation.
+
+For convenience, a client crate is included for Rust clients, but it isn't
+strictly needed, and any language with an MQTT client can read the data.
 
 ## Where it runs
 
 On the machine where the Claude Code profiles live: the daemon reads each
 profile's `.credentials.json`. The broker can be anywhere the daemon can reach
 over the network.
+
+## Install
+
+Requirements:
+
+- Linux with `systemd --user` for the shipped unit file
+  (`deploy/claude-usage-mqtt.service`, installed by `make install`). The
+  binaries themselves need no systemd.
+- A Rust toolchain ([rustup](https://rustup.rs)). The project builds and tests
+  with the toolchain `rust-toolchain.toml` pins (1.96.1); rustup picks it up
+  automatically in a clone. No minimum supported version is declared.
+- A C compiler, and `cmake` where the TLS stack's `aws-lc-sys` build falls back
+  to it (Debian/Ubuntu: `build-essential cmake`; Fedora: `gcc make cmake`).
+- An MQTT broker reachable from the host (see [Broker setup](#broker-setup)).
+- The Claude Code CLI (`claude`) on the daemon's `PATH`, so it can refresh
+  expired tokens (see [Credentials](#credentials-read-only-on-purpose));
+  optional with `refresh.enabled = false`.
+- `mosquitto`, only to run the end-to-end tests; they skip without it.
+
+From crates.io:
+
+```sh
+cargo install --locked claude-usage-mqtt          # the daemon
+cargo install --locked claude-usage-mqtt-client   # the claude-usage CLI
+```
+
+The crates carry the binaries only: the systemd unit, `config.example.toml`
+and `scripts/claude-profile` are in this repository. The unit runs the daemon
+from `~/.local/bin`, where `make install` puts it, not from `~/.cargo/bin`,
+where `cargo install` does; for a systemd install, use a clone. From a clone,
+which installs the unit as well:
+
+```sh
+make rust-check     # fmt, clippy, tests (needs mosquitto for the e2e suite)
+make install        # ~/.local/bin + systemd --user unit
+cargo install --locked --path crates/claude-usage-mqtt-client  # the claude-usage CLI
+
+mkdir -p ~/.config/claude-usage-mqtt
+cp config.example.toml ~/.config/claude-usage-mqtt/config.toml
+$EDITOR ~/.config/claude-usage-mqtt/config.toml
+
+# Broker password — never goes in the config file.
+echo 'CLAUDE_USAGE_MQTT_PASSWORD=...' > ~/.config/claude-usage-mqtt/env
+chmod 600 ~/.config/claude-usage-mqtt/env
+
+claude-usage-mqtt --check      # validate config + report each profile's token
+systemctl --user enable --now claude-usage-mqtt
+journalctl --user -u claude-usage-mqtt -f
+```
+
+`--check` makes no API call and no broker connection; it just proves the config
+parses and tells you which profiles have live tokens. Run by hand it reports
+`password: none (anonymous)`, and that is expected: the daemon reads the broker
+password from `CLAUDE_USAGE_MQTT_PASSWORD` in its own environment (or from
+`password_file` in the config), and the `env` file you just wrote is read only
+by the systemd unit. The `journalctl` line after `enable --now` is where a wrong
+password shows, as a refused broker connection.
+
+### Reloading
+
+```sh
+$EDITOR ~/.config/claude-usage-mqtt/config.toml
+claude-usage-mqtt --check
+systemctl --user reload claude-usage-mqtt
+```
+
+A reload (SIGHUP) is an in-process restart: the daemon stops, reconnects, and
+rehydrates from the retained topics, so it costs no API call a restart would not
+have made. `daemon/status` blips `offline` then `online` for the length of one
+connect. A config that fails to load or validate is rejected with a log line and
+the running one keeps going — which is why `--check` first is only a courtesy to
+yourself.
+
+Deploying to another host over ssh: `make deploy DEPLOY_HOST=user@host`.
+
+## Broker setup
+
+Needs a user with write access to `<prefix>/#`. Mosquitto ACL:
+
+```
+user claude-usage
+topic write claude/usage/#
+topic read claude/usage/#
+```
+
+Read access is required, not optional: the daemon subscribes to its own
+bookkeeping topics to rehydrate on startup.
 
 ## Credentials: read-only, on purpose
 
@@ -317,7 +406,10 @@ and now they would clear each other's profiles as well.
 
 Anything that speaks MQTT can subscribe to the topic tree above. For consumers
 that would rather not re-encode the topics and payload structs, two crates in
-this workspace share the daemon's own definitions:
+this workspace share the daemon's own definitions. Both are published on
+crates.io:
+[`claude-usage-mqtt-core`](https://crates.io/crates/claude-usage-mqtt-core) and
+[`claude-usage-mqtt-client`](https://crates.io/crates/claude-usage-mqtt-client).
 
 - **`claude-usage-mqtt-core`** — the topic builder/parser and payload schemas.
   The daemon and the client both depend on it, so the wire format cannot drift.
@@ -453,59 +545,6 @@ this workspace share the daemon's own definitions:
   config file sets `password_file`, that file — never a flag. The file's
   `client_id` is deliberately ignored; the CLI always uses a fresh
   per-invocation id so it cannot evict the running daemon from the broker.
-
-## Install
-
-```sh
-make rust-check     # fmt, clippy, tests (needs mosquitto for the e2e suite)
-make install        # ~/.local/bin + systemd --user unit
-cargo install --locked --path crates/claude-usage-mqtt-client  # the claude-usage CLI
-
-mkdir -p ~/.config/claude-usage-mqtt
-cp config.example.toml ~/.config/claude-usage-mqtt/config.toml
-$EDITOR ~/.config/claude-usage-mqtt/config.toml
-
-# Broker password — never goes in the config file.
-echo 'CLAUDE_USAGE_MQTT_PASSWORD=...' > ~/.config/claude-usage-mqtt/env
-chmod 600 ~/.config/claude-usage-mqtt/env
-
-claude-usage-mqtt --check      # validate config + report each profile's token
-systemctl --user enable --now claude-usage-mqtt
-journalctl --user -u claude-usage-mqtt -f
-```
-
-`--check` makes no API call and no broker connection; it just proves the config
-parses and tells you which profiles have live tokens.
-
-### Reloading
-
-```sh
-$EDITOR ~/.config/claude-usage-mqtt/config.toml
-claude-usage-mqtt --check
-systemctl --user reload claude-usage-mqtt
-```
-
-A reload (SIGHUP) is an in-process restart: the daemon stops, reconnects, and
-rehydrates from the retained topics, so it costs no API call a restart would not
-have made. `daemon/status` blips `offline` then `online` for the length of one
-connect. A config that fails to load or validate is rejected with a log line and
-the running one keeps going — which is why `--check` first is only a courtesy to
-yourself.
-
-Deploying to another host over ssh: `make deploy DEPLOY_HOST=user@host`.
-
-## Broker setup
-
-Needs a user with write access to `<prefix>/#`. Mosquitto ACL:
-
-```
-user claude-usage
-topic write claude/usage/#
-topic read claude/usage/#
-```
-
-Read access is required, not optional: the daemon subscribes to its own
-bookkeeping topics to rehydrate on startup.
 
 ## Development
 

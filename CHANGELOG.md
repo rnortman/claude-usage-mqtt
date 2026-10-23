@@ -4,6 +4,24 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+## 0.2.1 — 2026-10-22
+
+- The three crates are published on crates.io: the daemon
+  (`cargo install --locked claude-usage-mqtt`), the `claude-usage` CLI
+  (`cargo install --locked claude-usage-mqtt-client`), and the
+  `claude-usage-mqtt-core` / `claude-usage-mqtt-client` libraries for other
+  consumers of the topic tree. No code changed since 0.2.0.
+- The README now opens with installation: a requirements list (Linux with
+  `systemd --user` for the shipped unit, a Rust toolchain, a C compiler for the
+  TLS stack, a reachable MQTT broker, the `claude` CLI for token refresh), the
+  crates.io install lines, then the clone route, reloading and broker setup —
+  ahead of the topic-tree reference.
+- `make publish-check` dry-runs the whole workspace in one `cargo publish
+  --workspace --dry-run --locked`, so it passes before any crate is on
+  crates.io.
+- The lockfile moves `chacha20` (pulled in by the MQTT client's TLS stack) off
+  the yanked 0.10.1 release.
+
 ## 0.2.0 — 2026-10-18
 
 - **Breaking** (payload, version 0.2.0): the per-profile snapshot topic

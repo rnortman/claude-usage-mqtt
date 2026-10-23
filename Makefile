@@ -64,12 +64,13 @@ deploy: release-musl
 	scp deploy/$(BIN).service $(DEPLOY_HOST):/tmp/$(BIN).service
 	ssh $(DEPLOY_HOST) 'bash -s' < deploy/remote-install.sh
 
-# Pre-publish gate: dry-run `cargo publish` for each crate in dependency order
-# (core first, since the others depend on it). No crate is actually published.
+# Pre-publish gate: dry-run `cargo publish` for the whole workspace. Cargo
+# packages the crates in dependency order (core first) and verifies each one
+# against a temporary registry holding its siblings, so the check passes before
+# any of them is on crates.io. No crate is actually published; the real release
+# is `cargo publish --workspace`.
 publish-check:
-	cargo publish --dry-run -p claude-usage-mqtt-core
-	cargo publish --dry-run -p claude-usage-mqtt-client
-	cargo publish --dry-run -p claude-usage-mqtt
+	cargo publish --workspace --dry-run --locked
 
 clean:
 	cargo clean
