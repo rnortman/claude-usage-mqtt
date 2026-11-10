@@ -1,15 +1,24 @@
-//! A read-only client for the claude-usage-mqtt topic tree.
+//! Clients for the claude-usage-mqtt topic tree.
 //!
-//! It subscribes under a daemon's prefix and decodes each retained value into a
+//! [`UsageClient`] is read-only. It subscribes to a daemon's `daemon/` and
+//! `profile/` subtrees and decodes each retained value into a
 //! typed [`Event`], sharing the exact schema definitions the daemon publishes
 //! (`claude-usage-mqtt-core`) so a wire mismatch is a compile error rather than a
 //! silent decode bug. Two entry points: [`UsageClient::next_event`] streams
 //! events forever; [`UsageClient::fetch_retained`] collects the current retained
 //! tree once and returns.
+//!
+//! [`AgentClient`] publishes into the agent tree (`<prefix>/agents/`) and
+//! reads account spend back; see [`agents`].
 
+pub mod agents;
 pub mod config;
+pub use agents::{
+    AgentClient, AgentClientConfig, AgentError, DEFAULT_SESSION_TTL_S, MIN_SESSION_TTL_S,
+};
 pub use config::load_client_config;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -20,7 +29,7 @@ use claude_usage_mqtt_core::{
 use jiff::Timestamp;
 use rumqttc::Transport;
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event as MqttEvent, Incoming, MqttOptions};
+use rumqttc::v5::{AsyncClient, Event as MqttEvent, EventLoop, Incoming, MqttOptions};
 use tokio::sync::mpsc;
 
 /// How to reach the broker. `password` is the resolved secret, never a file
@@ -123,11 +132,94 @@ impl From<rumqttc::v5::ClientError> for ClientError {
     }
 }
 
+/// Opens a connection to the broker `cfg` names and drives it to its first
+/// `ConnAck`. A refused CONNACK (bad credentials) and a network failure
+/// (wrong host, TLS error) both surface here as [`ClientError::Connect`], so a
+/// misconfiguration is reported instead of hanging in a silent 200ms
+/// reconnect loop. `cfg.keep_alive_s` is the caller's to have checked.
+// These option setters mirror the daemon's `client_options` in
+// `crates/claude-usage-mqtt/src/mqtt.rs` and stay separate on purpose: core
+// is network-free, and everything from `AsyncClient::new` on differs between
+// the two binaries by design.
+pub(crate) async fn open(cfg: &ClientConfig) -> Result<(AsyncClient, EventLoop), ClientError> {
+    let mut opts = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
+    opts.set_keep_alive(Duration::from_secs(cfg.keep_alive_s));
+    opts.set_clean_start(true);
+    if let Some(user) = &cfg.username {
+        opts.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());
+    }
+    if cfg.tls {
+        opts.set_transport(Transport::tls_with_default_config());
+    }
+    let (client, mut eventloop) = AsyncClient::new(opts, 256);
+    loop {
+        match eventloop.poll().await {
+            Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => break,
+            Ok(_) => {}
+            Err(e) => return Err(ClientError::Connect(Box::new(e))),
+        }
+    }
+    Ok((client, eventloop))
+}
+
+/// A received publish: topic and payload.
+pub(crate) type Received = (String, Vec<u8>);
+
+/// The latest payload per topic from `rx`, in order of first sight, gathered
+/// until `quiesce` passes with no new message, `timeout` expires, or `rx`
+/// closes.
+pub(crate) async fn collect_retained(
+    rx: &mut mpsc::UnboundedReceiver<Received>,
+    quiesce: Duration,
+    timeout: Duration,
+) -> Vec<Received> {
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, Vec<u8>> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // The quiesce window only bounds the *gap* between messages, so it
+        // must not start ticking until the first one arrives. Until then the
+        // SUBSCRIBE round trip and the broker's retained flush can take longer
+        // than `quiesce`; the overall `timeout` is the sole bound on an empty
+        // or slow-to-start tree.
+        let quiesce_at = if latest.is_empty() {
+            deadline
+        } else {
+            (tokio::time::Instant::now() + quiesce).min(deadline)
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep_until(quiesce_at) => break,
+            msg = rx.recv() => match msg {
+                None => break,
+                Some((topic, payload)) => {
+                    if !latest.contains_key(&topic) {
+                        order.push(topic.clone());
+                    }
+                    latest.insert(topic, payload);
+                }
+            },
+        }
+    }
+    order
+        .into_iter()
+        .map(|t| {
+            let p = latest.remove(&t).unwrap_or_default();
+            (t, p)
+        })
+        .collect()
+}
+
+/// Reports a retained payload that would not decode and is being skipped.
+pub(crate) fn skip_undecodable(e: &ClientError) {
+    eprintln!("skipping undecodable retained topic: {e}");
+}
+
 pub struct UsageClient {
     client: AsyncClient,
     topics: Topics,
     prefix: String,
-    rx: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    rx: mpsc::UnboundedReceiver<Received>,
     eventloop: tokio::task::JoinHandle<()>,
 }
 
@@ -138,44 +230,20 @@ impl Drop for UsageClient {
 }
 
 impl UsageClient {
-    /// Connect and subscribe to the whole prefix. Retained values begin arriving
-    /// immediately.
-    // These option setters mirror the daemon's `client_options` in
-    // `crates/claude-usage-mqtt/src/mqtt.rs` and stay separate on purpose: core
-    // is network-free, and everything from `AsyncClient::new` on differs between
-    // the two binaries by design.
+    /// Connect and subscribe to the usage tree, [`Topics::usage_filters`].
+    /// Retained values begin arriving immediately. The agent tree is not
+    /// subscribed: its heartbeats would restart
+    /// [`UsageClient::fetch_retained`]'s quiesce clock.
     pub async fn connect(cfg: ClientConfig) -> Result<Self, ClientError> {
         check_keep_alive(cfg.keep_alive_s).map_err(ClientError::InvalidConfig)?;
-        let mut opts = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
-        opts.set_keep_alive(Duration::from_secs(cfg.keep_alive_s));
-        opts.set_clean_start(true);
-        if let Some(user) = &cfg.username {
-            opts.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());
-        }
-        if cfg.tls {
-            opts.set_transport(Transport::tls_with_default_config());
-        }
-
+        let (client, mut eventloop) = open(&cfg).await?;
         let topics = Topics::new(cfg.topic_prefix);
         let prefix = topics.prefix().to_string();
 
-        let (client, mut eventloop) = AsyncClient::new(opts, 256);
-
-        // Drive the connection to its first ConnAck before returning. A refused
-        // CONNACK (bad credentials) and a network failure (wrong host, TLS
-        // error) both surface here as `Err`, so a misconfiguration is reported
-        // instead of hanging in a silent 200ms reconnect loop.
-        loop {
-            match eventloop.poll().await {
-                Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => break,
-                Ok(_) => {}
-                Err(e) => return Err(ClientError::Connect(Box::new(e))),
-            }
+        let filters = topics.usage_filters();
+        for f in &filters {
+            client.subscribe(f.clone(), QoS::AtLeastOnce).await?;
         }
-
-        client
-            .subscribe(format!("{prefix}/#"), QoS::AtLeastOnce)
-            .await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         // The background task re-subscribes on every ConnAck, not just the first.
@@ -184,7 +252,6 @@ impl UsageClient {
         // SUBSCRIBE the client would sit connected but deaf. Re-issuing on each
         // ConnAck keeps the stream alive across reconnects.
         let sub_client = client.clone();
-        let sub_filter = format!("{prefix}/#");
         let handle = tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
@@ -195,9 +262,9 @@ impl UsageClient {
                         }
                     }
                     Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
-                        let _ = sub_client
-                            .subscribe(sub_filter.clone(), QoS::AtLeastOnce)
-                            .await;
+                        for f in &filters {
+                            let _ = sub_client.subscribe(f.clone(), QoS::AtLeastOnce).await;
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
@@ -241,49 +308,18 @@ impl UsageClient {
         quiesce: Duration,
         timeout: Duration,
     ) -> Result<Vec<Event>, ClientError> {
-        // Latest payload per topic, in arrival order of first sight.
-        let mut order: Vec<String> = Vec::new();
-        let mut latest: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            // The quiesce window only bounds the *gap* between messages, so it
-            // must not start ticking until the first one arrives. Until then the
-            // SUBSCRIBE round trip and the broker's retained flush can take longer
-            // than `quiesce`; the overall `timeout` is the sole bound on an empty
-            // or slow-to-start tree.
-            let quiesce_at = if latest.is_empty() {
-                deadline
-            } else {
-                (tokio::time::Instant::now() + quiesce).min(deadline)
-            };
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                _ = tokio::time::sleep_until(quiesce_at) => break,
-                msg = self.rx.recv() => match msg {
-                    None => break,
-                    Some((topic, payload)) => {
-                        if !latest.contains_key(&topic) {
-                            order.push(topic.clone());
-                        }
-                        latest.insert(topic, payload);
-                    }
-                },
-            }
-        }
+        let latest = collect_retained(&mut self.rx, quiesce, timeout).await;
 
         // A single undecodable retained payload (stale schema, hand-published
         // junk) must not discard the rest of the tree; skip it and report it to
         // stderr, matching the "skippable, never stream-ending" BadPayload
         // contract that the streaming path already honors.
         let mut out = Vec::new();
-        for topic in order {
-            let payload = &latest[&topic];
-            match self.decode(&topic, payload) {
+        for (topic, payload) in latest {
+            match self.decode(&topic, &payload) {
                 Ok(Some(ev)) => out.push(ev),
                 Ok(None) => {}
-                Err(e) => eprintln!("skipping undecodable retained topic: {e}"),
+                Err(e) => skip_undecodable(&e),
             }
         }
         Ok(out)
@@ -365,5 +401,43 @@ impl UsageClient {
     /// Explicit disconnect. Dropping the client also severs the connection.
     pub async fn disconnect(&self) {
         let _ = self.client.disconnect().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_retained_ends_on_quiesce_and_keeps_the_latest_per_topic() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(("a".to_string(), b"1".to_vec())).unwrap();
+        tx.send(("b".to_string(), b"2".to_vec())).unwrap();
+        tx.send(("a".to_string(), b"3".to_vec())).unwrap();
+        let start = std::time::Instant::now();
+        let got =
+            collect_retained(&mut rx, Duration::from_millis(50), Duration::from_secs(5)).await;
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), b"3".to_vec()),
+                ("b".to_string(), b"2".to_vec())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_retained_of_nothing_runs_to_the_timeout() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let start = std::time::Instant::now();
+        let got = collect_retained(
+            &mut rx,
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(got.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(200));
     }
 }

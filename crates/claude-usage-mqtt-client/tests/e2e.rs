@@ -12,14 +12,18 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use claude_usage_mqtt_client::{ClientConfig, ClientError, Event, UsageClient};
+use claude_usage_mqtt_client::{
+    AgentClient, AgentClientConfig, AgentError, ClientConfig, ClientError, Event, UsageClient,
+};
 use claude_usage_mqtt_core::{
-    AuthState, KEEP_ALIVE_RANGE_S, NextResetPayload, PASSWORD_ENV, ResetPingPayload, Snapshot,
-    Source, ThrottlePayload, Topics, Window,
+    AccountKind, AccountSpend, AgentTopics, AuthState, KEEP_ALIVE_RANGE_S, NextResetPayload,
+    PASSWORD_ENV, ResetPingPayload, SessionRecord, SessionState, Snapshot, Source, ThrottlePayload,
+    Topics, Window,
 };
 use jiff::Timestamp;
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, MqttOptions};
+use rumqttc::v5::mqttbytes::v5::Publish;
+use rumqttc::v5::{AsyncClient, Event as MqttEvent, Incoming, MqttOptions};
 
 /// A free port, never the same one twice in this process: the kernel can hand
 /// a just-released port to the next `bind(:0)` before the broker it was meant
@@ -56,20 +60,30 @@ impl Broker {
     /// another port, at most three times. The error says why the last attempt
     /// failed, with mosquitto's own log.
     fn start() -> Result<Self, String> {
+        Self::start_with_acl(None)
+    }
+
+    /// As [`Broker::start`], with `acl` as mosquitto's ACL file when given.
+    /// Clients connect anonymously, so the file's leading `topic` lines are
+    /// the ones that apply to them.
+    fn start_with_acl(acl: Option<&str>) -> Result<Self, String> {
         let mut last = String::new();
         for _ in 0..3 {
             let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
             let port = free_port();
             let conf = dir.path().join("mosquitto.conf");
             let log = dir.path().join("mosquitto.log");
-            std::fs::write(
-                &conf,
-                format!(
-                    "listener {port} 127.0.0.1\nallow_anonymous true\npersistence false\nlog_dest file {}\n",
-                    log.display()
-                ),
-            )
-            .map_err(|e| format!("write {}: {e}", conf.display()))?;
+            let mut body = format!(
+                "listener {port} 127.0.0.1\nallow_anonymous true\npersistence false\nlog_dest file {}\n",
+                log.display()
+            );
+            if let Some(acl) = acl {
+                let acl_path = dir.path().join("acl");
+                std::fs::write(&acl_path, acl)
+                    .map_err(|e| format!("write {}: {e}", acl_path.display()))?;
+                body.push_str(&format!("acl_file {}\n", acl_path.display()));
+            }
+            std::fs::write(&conf, body).map_err(|e| format!("write {}: {e}", conf.display()))?;
 
             match spawn_mosquitto(&conf, &log) {
                 Spawn::Up(child) => {
@@ -86,6 +100,23 @@ impl Broker {
         Err(format!(
             "mosquitto exited during start-up 3 times; the last one logged:\n{last}"
         ))
+    }
+
+    /// Kill the broker and start it again on the same port and conf. With
+    /// `persistence false` the new one starts with no retained messages.
+    fn restart(&mut self) -> Result<(), String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let conf = self._dir.path().join("mosquitto.conf");
+        let log = self._dir.path().join("mosquitto.log");
+        match spawn_mosquitto(&conf, &log) {
+            Spawn::Up(child) => {
+                self.child = child;
+                Ok(())
+            }
+            Spawn::Exited(said) => Err(format!("restarted mosquitto exited:\n{said}")),
+            Spawn::Failed(why) => Err(why),
+        }
     }
 }
 
@@ -160,7 +191,10 @@ impl Drop for Broker {
 
 macro_rules! broker_or_skip {
     () => {
-        match Broker::start() {
+        broker_or_skip!(Broker::start())
+    };
+    ($start:expr) => {
+        match $start {
             Ok(b) => b,
             Err(why) => {
                 if std::env::var_os("CI").is_some() {
@@ -902,4 +936,467 @@ async fn cli_snapshot_filters_by_profile() {
         !stdout.contains("\"work\""),
         "work should be filtered out: {stdout}"
     );
+}
+
+// ---- The agent tree -------------------------------------------------------
+
+const PREFIX: &str = "claude/usage";
+
+fn agent_config(port: u16, publisher: &str, host: &str, ttl_s: u32) -> AgentClientConfig {
+    let mut c = AgentClientConfig::new(client_config(port), publisher, host);
+    c.session_ttl_s = ttl_s;
+    c
+}
+
+async fn agent(port: u16, publisher: &str, host: &str, ttl_s: u32) -> AgentClient {
+    AgentClient::connect(agent_config(port, publisher, host, ttl_s))
+        .await
+        .expect("agent client connects")
+}
+
+fn session(id: &str, publisher: &str, host: &str) -> SessionRecord {
+    let mut r = SessionRecord::running(id, publisher, host, Timestamp::now());
+    r.harness = Some("claude".into());
+    r.model = Some("opus".into());
+    r
+}
+
+fn spend(account: &str, publisher: &str, host: &str, usd: f64) -> AccountSpend {
+    AccountSpend::new(
+        account,
+        AccountKind::ApiKey,
+        publisher,
+        host,
+        "2026-11",
+        usd,
+        Timestamp::now(),
+    )
+}
+
+/// A plain MQTT 5 subscriber that forwards every publish it receives.
+struct Subscriber {
+    _client: AsyncClient,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Publish>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Subscriber {
+    async fn new(port: u16, filter: &str) -> Self {
+        let opts = MqttOptions::new(format!("test-sub-{}", free_port()), "127.0.0.1", port);
+        let (client, mut eventloop) = AsyncClient::new(opts, 64);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (subacked, on_suback) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut subacked = Some(subacked);
+            while let Ok(ev) = eventloop.poll().await {
+                match ev {
+                    MqttEvent::Incoming(Incoming::Publish(p)) => {
+                        if tx.send(p).is_err() {
+                            break;
+                        }
+                    }
+                    MqttEvent::Incoming(Incoming::SubAck(_)) => {
+                        if let Some(s) = subacked.take() {
+                            let _ = s.send(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        client.subscribe(filter, QoS::AtLeastOnce).await.unwrap();
+        // Live (non-retained) traffic reaches a subscriber only once the
+        // broker has acknowledged the subscription.
+        tokio::time::timeout(Duration::from_secs(5), on_suback)
+            .await
+            .expect("SUBACK within 5 s")
+            .expect("subscriber task alive");
+        Self {
+            _client: client,
+            rx,
+            task,
+        }
+    }
+
+    /// Everything received within `window`.
+    async fn within(&mut self, window: Duration) -> Vec<Publish> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(p)) = tokio::time::timeout_at(deadline, self.rx.recv()).await {
+            out.push(p);
+        }
+        out
+    }
+}
+
+/// What a subscriber that connects now receives as retained under `filter`.
+async fn retained(port: u16, filter: &str) -> Vec<Publish> {
+    let mut sub = Subscriber::new(port, filter).await;
+    sub.within(Duration::from_millis(700))
+        .await
+        .into_iter()
+        .filter(|p| p.retain)
+        .collect()
+}
+
+fn topic_of(p: &Publish) -> String {
+    String::from_utf8_lossy(&p.topic).into_owned()
+}
+
+fn expiry_of(p: &Publish) -> Option<u32> {
+    p.properties
+        .as_ref()
+        .and_then(|pp| pp.message_expiry_interval)
+}
+
+const FLUSH: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn agent_session_is_retained_with_an_expiry() {
+    let broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 90).await;
+    let rec = session("inv-1", "ccc", "atlas");
+    a.put_session(rec.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    let got = retained(broker.port, &t.sessions_filter()).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(topic_of(&got[0]), t.session("ccc", "atlas", "inv-1"));
+    let decoded: SessionRecord = serde_json::from_slice(&got[0].payload).unwrap();
+    assert_eq!(decoded, rec);
+    let expiry = expiry_of(&got[0]).expect("a session record carries an expiry");
+    assert!(expiry <= 90 && expiry > 0, "{expiry}");
+}
+
+#[tokio::test]
+async fn agent_session_expires_when_its_publisher_dies() {
+    let broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 6).await;
+    a.put_session(session("inv-1", "ccc", "atlas"))
+        .await
+        .unwrap();
+    a.flush(FLUSH).await.unwrap();
+    // Dropped without `end_session`: no heartbeat, no withdrawal.
+    drop(a);
+
+    assert_eq!(retained(broker.port, &t.sessions_filter()).await.len(), 1);
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let got = retained(broker.port, &t.sessions_filter()).await;
+    assert!(got.is_empty(), "the record outlived its TTL: {got:?}");
+}
+
+#[tokio::test]
+async fn agent_heartbeat_keeps_a_live_session_retained() {
+    let broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 6).await;
+    let rec = session("inv-1", "ccc", "atlas");
+    let first = rec.updated_at;
+    a.put_session(rec).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(7500)).await;
+    let got = retained(broker.port, &t.sessions_filter()).await;
+    assert_eq!(
+        got.len(),
+        1,
+        "the heartbeat did not keep the record: {got:?}"
+    );
+    let decoded: SessionRecord = serde_json::from_slice(&got[0].payload).unwrap();
+    assert!(decoded.updated_at > first, "updated_at was not refreshed");
+    assert_eq!(decoded.started_at, first);
+}
+
+#[tokio::test]
+async fn agent_end_session_publishes_ended_and_withdraws() {
+    let broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 90).await;
+    let mut live = Subscriber::new(broker.port, &t.ended_filter()).await;
+    a.put_session(session("inv-1", "ccc", "atlas"))
+        .await
+        .unwrap();
+    let mut fin = session("inv-1", "ccc", "atlas");
+    fin.state = SessionState::Ended;
+    fin.ended_at = Some(Timestamp::now());
+    fin.ok = Some(true);
+    fin.cost_usd = Some(0.25);
+    a.end_session(fin.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    let ended = live.within(Duration::from_millis(700)).await;
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(topic_of(&ended[0]), t.ended("ccc", "atlas"));
+    assert!(!ended[0].retain);
+    let decoded: SessionRecord = serde_json::from_slice(&ended[0].payload).unwrap();
+    assert_eq!(decoded, fin);
+
+    assert!(retained(broker.port, &t.sessions_filter()).await.is_empty());
+    assert!(retained(broker.port, &t.ended_filter()).await.is_empty());
+}
+
+#[tokio::test]
+async fn agent_accounts_are_retained_and_fetched_across_publishers_and_hosts() {
+    let broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let mut a = agent(broker.port, "ccc", "atlas", 90).await;
+    let b = agent(broker.port, "ccc", "zeus", 90).await;
+    let c = agent(broker.port, "brenn", "atlas", 90).await;
+    let sa = spend("team", "ccc", "atlas", 1.0);
+    let sb = spend("team", "ccc", "zeus", 2.0);
+    let sc = spend("team", "brenn", "atlas", 4.0);
+    a.put_account(sa.clone()).await.unwrap();
+    b.put_account(sb.clone()).await.unwrap();
+    c.put_account(sc.clone()).await.unwrap();
+    for x in [&a, &b, &c] {
+        x.flush(FLUSH).await.unwrap();
+    }
+    let pubc = publisher(broker.port).await;
+    pubc.publish(
+        t.account("junk", "atlas", "team"),
+        QoS::AtLeastOnce,
+        true,
+        "not json",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let one = retained(broker.port, &t.account("ccc", "zeus", "team")).await;
+    assert_eq!(one.len(), 1);
+    assert_eq!(expiry_of(&one[0]), None, "an account level never expires");
+
+    let mut got = a
+        .fetch_accounts(Duration::from_millis(300), Duration::from_secs(5))
+        .await
+        .unwrap();
+    got.sort_by(|x, y| (&x.publisher, &x.host).cmp(&(&y.publisher, &y.host)));
+    assert_eq!(got, vec![sc, sa, sb]);
+}
+
+#[tokio::test]
+async fn agent_refuses_foreign_and_unsafe_records_and_publishes_nothing() {
+    let broker = broker_or_skip!();
+    let a = agent(broker.port, "ccc", "atlas", 90).await;
+    let invalid = |r: Result<(), AgentError>| {
+        assert!(
+            matches!(r, Err(AgentError::Client(ClientError::InvalidConfig(_)))),
+            "{r:?}"
+        )
+    };
+    invalid(a.put_session(session("inv-1", "brenn", "atlas")).await);
+    invalid(a.put_session(session("inv-1", "ccc", "zeus")).await);
+    invalid(a.put_session(session("a/b", "ccc", "atlas")).await);
+    invalid(a.put_session(session("", "ccc", "atlas")).await);
+    invalid(a.end_session(session("inv-1", "ccc", "zeus")).await);
+    invalid(a.put_account(spend("team/x", "ccc", "atlas", 1.0)).await);
+    invalid(a.put_account(spend("team", "brenn", "atlas", 1.0)).await);
+    a.flush(FLUSH).await.unwrap();
+    let got = retained(broker.port, &format!("{PREFIX}/agents/#")).await;
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[tokio::test]
+async fn agent_flush_reports_a_publish_the_acl_refused() {
+    let acl = format!("topic read {PREFIX}/#\ntopic write {PREFIX}/agents/ok/#\n");
+    let broker = broker_or_skip!(Broker::start_with_acl(Some(&acl)));
+    let ok = agent(broker.port, "ok", "atlas", 90).await;
+    let bad = agent(broker.port, "bad", "atlas", 90).await;
+
+    ok.put_account(spend("team", "ok", "atlas", 1.0))
+        .await
+        .unwrap();
+    ok.flush(FLUSH).await.unwrap();
+
+    bad.put_account(spend("team", "bad", "atlas", 1.0))
+        .await
+        .unwrap();
+    match bad.flush(FLUSH).await {
+        Err(AgentError::Refused { reason }) => {
+            assert!(reason.contains("NotAuthorized"), "{reason}")
+        }
+        other => panic!("expected Refused, got {other:?}"),
+    }
+    let got = retained(broker.port, &format!("{PREFIX}/agents/bad/#")).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(
+        retained(broker.port, &format!("{PREFIX}/agents/ok/#"))
+            .await
+            .len(),
+        1
+    );
+    bad.flush(FLUSH).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_fetch_of_an_otherwise_empty_subtree_ends_on_quiesce() {
+    let broker = broker_or_skip!();
+    let mut a = agent(broker.port, "ccc", "atlas", 90).await;
+    let own = spend("team", "ccc", "atlas", 0.0);
+    a.put_account(own.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let got = a
+        .fetch_accounts(Duration::from_millis(200), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the read ran towards its timeout: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(got, vec![own]);
+}
+
+#[tokio::test]
+async fn agent_fetch_cut_by_a_lost_connection_fails() {
+    let mut broker = broker_or_skip!();
+    let mut a = agent(broker.port, "ccc", "atlas", 90).await;
+    let own = spend("team", "ccc", "atlas", 0.0);
+    a.put_account(own.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    let start = std::time::Instant::now();
+    // The long quiesce keeps the read open after its one record arrives.
+    let fetch = a.fetch_accounts(Duration::from_secs(4), Duration::from_secs(8));
+    let cut = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        broker.restart().expect("broker restarts on its port");
+    };
+    let (got, ()) = tokio::join!(fetch, cut);
+    assert!(
+        matches!(got, Err(AgentError::Client(ClientError::Connect(_)))),
+        "{got:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the cut read waited for its quiesce: {:?}",
+        start.elapsed()
+    );
+
+    a.put_account(own.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+    let got = a
+        .fetch_accounts(Duration::from_millis(200), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(got, vec![own]);
+}
+
+#[tokio::test]
+async fn agent_client_republishes_its_session_after_a_broker_restart() {
+    let mut broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 90).await;
+    a.put_session(session("inv-1", "ccc", "atlas"))
+        .await
+        .unwrap();
+    a.flush(FLUSH).await.unwrap();
+
+    broker.restart().expect("broker restarts on its port");
+    let mut got = Vec::new();
+    for _ in 0..10 {
+        got = retained(broker.port, &t.sessions_filter()).await;
+        if !got.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(got.len(), 1, "the session was not republished on reconnect");
+    assert_eq!(topic_of(&got[0]), t.session("ccc", "atlas", "inv-1"));
+}
+
+#[tokio::test]
+async fn agent_flush_reports_publishes_a_reconnect_lost_once() {
+    let mut broker = broker_or_skip!();
+    let t = AgentTopics::new(PREFIX);
+    let a = agent(broker.port, "ccc", "atlas", 90).await;
+
+    // A stopped broker accepts the publish into its socket and never acks
+    // it; killing it then drops the connection with the publish in flight.
+    let stopped = Command::new("kill")
+        .args(["-STOP", &broker.child.id().to_string()])
+        .status()
+        .expect("run kill -STOP");
+    assert!(stopped.success());
+    a.put_account(spend("team", "ccc", "atlas", 1.0))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    broker.restart().expect("broker restarts on its port");
+
+    let start = std::time::Instant::now();
+    match a.flush(FLUSH).await {
+        Err(AgentError::Lost { count }) => assert_eq!(count, 1),
+        other => panic!("expected Lost, got {other:?}"),
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the flush waited for an ack that cannot come: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        retained(broker.port, &t.accounts_filter()).await.is_empty(),
+        "the lost publish reached the broker after all"
+    );
+
+    let level = spend("team", "ccc", "atlas", 2.0);
+    a.put_account(level.clone()).await.unwrap();
+    a.flush(FLUSH).await.unwrap();
+    let got = retained(broker.port, &t.accounts_filter()).await;
+    assert_eq!(got.len(), 1, "{got:?}");
+    let decoded: AccountSpend = serde_json::from_slice(&got[0].payload).unwrap();
+    assert_eq!(decoded, level);
+}
+
+#[tokio::test]
+async fn usage_client_receives_nothing_from_the_agent_tree() {
+    let broker = broker_or_skip!();
+    let t = Topics::new(PREFIX);
+    let pubc = publisher(broker.port).await;
+    pubc.publish(t.daemon_status(), QoS::AtLeastOnce, true, "online")
+        .await
+        .unwrap();
+    // Agent-tree traffic far more often than the read's quiesce, for longer
+    // than its timeout.
+    let spam = pubc.clone();
+    let spammer = tokio::spawn(async move {
+        for i in 0..80 {
+            let _ = spam
+                .publish(
+                    format!("{PREFIX}/agents/ccc/atlas/session/inv-{}", i % 4),
+                    QoS::AtLeastOnce,
+                    true,
+                    "{}",
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut uc = UsageClient::connect(client_config(broker.port))
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let events = uc
+        .fetch_retained(Duration::from_millis(300), Duration::from_secs(6))
+        .await
+        .unwrap();
+    let took = start.elapsed();
+    spammer.abort();
+    assert!(
+        took < Duration::from_secs(3),
+        "agent-tree traffic held the read open for {took:?}"
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(&events[0], Event::DaemonStatus(s) if s == "online"));
 }

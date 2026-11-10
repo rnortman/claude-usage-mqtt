@@ -3,11 +3,16 @@
 //! consumer must agree on. Keeping them here means drift between producer and
 //! consumer is a compile error, not a silent wire mismatch.
 
+mod agents;
 pub mod mqtt_config;
 mod payloads;
 mod topics;
 mod window;
 
+pub use agents::{
+    AGENT_TREE_VERSION, AccountKind, AccountSpend, AgentTopics, Exhausted, ParsedAgentTopic,
+    SessionRecord, SessionState, exhausted, total_usd,
+};
 pub use mqtt_config::{
     KEEP_ALIVE_RANGE_S, MqttConfig, PASSWORD_ENV, check_keep_alive, expand_tilde, resolve_password,
 };

@@ -91,6 +91,15 @@ impl Topics {
         ]
     }
 
+    /// Subscription covering the usage tree: every topic the builders above
+    /// produce, and nothing of the agent tree.
+    pub fn usage_filters(&self) -> [String; 2] {
+        [
+            format!("{}/daemon/#", self.prefix),
+            format!("{}/profile/#", self.prefix),
+        ]
+    }
+
     /// The profile name a topic belongs to — the segment after
     /// `<prefix>/profile/` — for any topic under this prefix's profile subtree,
     /// including shapes `parse` does not recognize (a leftover from an older
@@ -257,6 +266,23 @@ mod tests {
         for topic in profile_topics(&t, "work") {
             assert!(topic.starts_with(stem), "{topic}");
         }
+    }
+
+    #[test]
+    fn usage_filters_cover_every_builder_and_no_agent_topic() {
+        let t = t();
+        let stems: Vec<String> = t
+            .usage_filters()
+            .iter()
+            .map(|f| f.strip_suffix('#').unwrap().to_string())
+            .collect();
+        let covered = |topic: &str| stems.iter().any(|s| topic.starts_with(s.as_str()));
+        let mut topics = profile_topics(&t, "work");
+        topics.extend([t.daemon_status(), t.daemon_throttle(), t.sync()]);
+        for topic in &topics {
+            assert!(covered(topic), "{topic}");
+        }
+        assert!(!covered("claude/usage/agents/ccc/atlas/account/team"));
     }
 
     #[test]

@@ -4,6 +4,32 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+- **New: the agent tree.** Tools that launch Claude agents (such as `ccc`)
+  can now publish their running sessions and their spend per account under
+  a new subtree, `<prefix>/agents/`, beside the daemon's `daemon/` and
+  `profile/`. Other sessions read it back to see who is running where and
+  whether an account's budget (for example an API key's monthly credit) is
+  spent. The README's new section "The agent tree" is the wire contract for
+  any publisher or reader, and gives a tightened broker ACL that confines
+  the daemon and each tool to their own subtrees. The daemon never reads or
+  clears `agents/`.
+- **Upgrade your readers.** `UsageClient` now subscribes only to
+  `<prefix>/daemon/#` and `<prefix>/profile/#` (from the new
+  `Topics::usage_filters`) instead of `<prefix>/#`. Readers built on 0.2.1
+  or earlier still subscribe to everything, so once tools publish into the
+  agent tree, its heartbeats keep their `fetch_retained` reads open until
+  the timeout.
+- `claude-usage-mqtt-client` gains `AgentClient` (configured by
+  `AgentClientConfig`) for publishers: it publishes sessions (retained with
+  an expiry, heartbeated, republished on reconnect), their end events and
+  account-spend levels, and reads all publishers' account levels back with
+  `fetch_accounts`. `flush` reports publishes the broker refused or a
+  reconnect lost. `UsageClient` stays read-only.
+- `claude-usage-mqtt-core` gains the `agents` module: topic builders and
+  subscription filters (`AgentTopics`), the payload types and the rules for
+  combining spend and exhaustion across publishers. Existing `Topics` API
+  unchanged.
+
 ## 0.2.1 — 2026-10-22
 
 - The three crates are published on crates.io: the daemon

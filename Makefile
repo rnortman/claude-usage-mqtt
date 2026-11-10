@@ -66,9 +66,12 @@ deploy: release-musl
 
 # Pre-publish gate: dry-run `cargo publish` for the whole workspace. Cargo
 # packages the crates in dependency order (core first) and verifies each one
-# against a temporary registry holding its siblings, so the check passes before
-# any of them is on crates.io. No crate is actually published; the real release
-# is `cargo publish --workspace`.
+# against a temporary registry holding its siblings. Bump the workspace version
+# first (`[workspace.package] version` and the workspace-internal requirements
+# in the root Cargo.toml): at a version already on crates.io the dry run
+# verifies each crate against its published siblings and fails whenever a crate
+# uses something new from one. No crate is actually published; the real
+# release is `cargo publish --workspace`.
 publish-check:
 	cargo publish --workspace --dry-run --locked
 

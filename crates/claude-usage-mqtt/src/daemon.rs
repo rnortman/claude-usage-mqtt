@@ -315,8 +315,12 @@ fn apply_rehydration(
             continue;
         };
         let Some(p) = profiles.iter_mut().find(|p| p.cfg.name == name) else {
-            // The tree under a prefix belongs to one daemon and mirrors its
-            // config, so a profile that is not in it is leftover state.
+            // `daemon/` and `profile/` under a prefix belong to one daemon and
+            // mirror its config, so a profile that is not in it is leftover
+            // state. `agents/` belongs to its publishers; the daemon never
+            // subscribes to it, so nothing there reaches this loop.
+            // TODO(platform-spend-reconcile): reconcile API-key spend in the
+            // agent tree against the Platform's billed figure.
             out.stale.entry(name).or_default().push(msg.topic.clone());
             continue;
         };

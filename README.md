@@ -105,6 +105,24 @@ topic read claude/usage/#
 Read access is required, not optional: the daemon subscribes to its own
 bookkeeping topics to rehydrate on startup.
 
+That ACL keeps working when tools publish into the agent tree under the same
+prefix, but it lets the daemon write there too. The tightened form confines
+the daemon to its own subtrees and each tool to its own (see "The agent
+tree"):
+
+```
+user claude-usage                          # the daemon
+topic readwrite claude/usage/daemon/#
+topic readwrite claude/usage/profile/#
+
+user ccc                                   # one tool
+topic read claude/usage/#
+topic write claude/usage/agents/ccc/#
+
+# or, for every tool at once, publisher = broker user name:
+pattern write claude/usage/agents/%u/#
+```
+
 ## Credentials: read-only, on purpose
 
 The daemon **never writes `.credentials.json` itself.** Claude Code owns that
@@ -398,9 +416,165 @@ the data, and `updated_at` already says how old it is.
 
 Because the state is the tree, the tree must mirror the config: on startup the
 daemon clears the retained topics of any profile that is no longer in its config.
+The `daemon/` and `profile/` subtrees under a prefix belong to one daemon; the
+`agents/` subtree belongs to the tools that publish into it, and the daemon
+neither reads nor clears it.
 **Run one daemon per prefix** — two daemons sharing a prefix already overwrite
 each other's `daemon/status` (one last will per connection) and `daemon/throttle`,
 and now they would clear each other's profiles as well.
+
+## The agent tree
+
+`<prefix>/agents/` is a subtree beside `daemon/` and `profile/` where tools
+that launch agents — `ccc`, brenn, anything else — publish what they are
+running and what they have spent on each account. The daemon neither reads,
+writes nor clears it. **This section is the contract**: a tool that cannot
+link the crates (its own MQTT client, a WASM guest) implements it from here.
+`claude-usage-mqtt-core` (`AgentTopics`, `SessionRecord`, `AccountSpend`,
+`total_usd`, `exhausted`) and `claude-usage-mqtt-client` (`AgentClient`) are
+one implementation of it.
+
+The tree requires an **MQTT 5 broker**: liveness rests on message expiry.
+
+### Topics
+
+`<p>` is the prefix; `<pub>` is the **publisher**, the name of the publishing
+tool (`ccc`, `brenn`); `<h>` is the host; `<id>` is a session id and
+`<account>` an account name. All of them are topic-safe: `[A-Za-z0-9._-]+`.
+
+| Topic | Retained | Payload |
+|---|---|---|
+| `<p>/agents/<pub>/<h>/session/<id>` | yes, with a message-expiry interval, while the session lives | session record, `state: "running"` |
+| `<p>/agents/<pub>/<h>/ended` | no | the final session record, `state: "ended"` |
+| `<p>/agents/<pub>/<h>/account/<account>` | yes, no expiry | account-spend record |
+
+Subscription filters: `<p>/agents/+/+/session/+` (what is running),
+`<p>/agents/+/+/ended` (what ends), `<p>/agents/+/+/account/+` (spend). All
+publishes are QoS 1.
+
+### Rules
+
+- **A publisher writes only under `<p>/agents/<pub>/`.** No topic is written
+  by more than one publisher, and none by read-modify-write across hosts:
+  every retained value is a *level* owned by one publisher-and-host, and
+  readers combine levels. A lost or repeated publish is repaired by the next
+  one.
+- **Segregation is by fixed position**, so a broker ACL can enforce it — the
+  tightened ACL in "Broker setup". A tool can be confined further to one host
+  with `…/agents/ccc/<h>/#`.
+- **A refused publish is visible.** An MQTT 5 broker answers a QoS 1 publish
+  outside the client's ACL with a PUBACK whose reason code is a failure (135,
+  Not authorized, on mosquitto). Success and 16, No matching subscribers, are
+  the two codes that mean the publish was accepted.
+- **Liveness is expiry.** A session record is published retained with an
+  MQTT 5 message-expiry interval of the session TTL (default 90 s) and
+  republished — a **heartbeat**, with a fresh `updated_at` — every third of
+  that. A session that ends is withdrawn at once with an empty retained
+  payload. A publisher that dies stops heartbeating, and the broker drops the
+  record within the TTL. So *what is retained under `session/` is what is
+  running*: no join, no clean-up duty. A publisher that reconnects
+  republishes its live sessions. No last will is used: a connection has one,
+  and a publisher may run many sessions on one connection.
+- **An empty payload is a withdrawal**, as in the usage tree; readers skip it.
+- **Unknown fields are ignored by readers**; `v` (now 1) changes only for an
+  incompatible change. Publisher-specific data goes under `meta` and nowhere
+  else, so the top level stays free for later generic fields.
+
+### Session record
+
+A *session* is the publisher's own unit of running agent work — for `ccc` an
+invocation, for brenn a conversation.
+
+```json
+{ "v": 1, "id": "…", "publisher": "ccc", "host": "atlas", "state": "running",
+  "started_at": "…", "updated_at": "…",
+  "parent": "…", "root": "…", "session": "…",
+  "harness": "claude", "model": "…", "agent": "explorer",
+  "account": "team01", "account_kind": "subscription",
+  "cwd": "/abs/path", "pid": 12345, "title": "…",
+  "cost_usd": 0.4312,
+  "ended_at": "…", "duration_ms": 81234, "ok": true,
+  "meta": { } }
+```
+
+| Field | Required | Meaning, the same for every harness |
+|---|---|---|
+| `v`, `id`, `publisher`, `host`, `state`, `started_at`, `updated_at` | yes | `id` is unique within the publisher; `publisher` and `host` repeat the topic; `state` is `running` or `ended`. Timestamps are RFC 3339. |
+| `parent` | no | `id` of the session that launched this one, same publisher, any host. |
+| `root` | no | An opaque identifier shared by every session of one tree, from one publisher; readers group a tree by `publisher` and `root`. For a tree started by a session with no outside grouping it is that session's `id`. A publisher may instead take it from outside — several top-level sessions launched as one group — so a reader must not assume that a session with `id == root` exists, or that a tree has exactly one session without a `parent`. |
+| `session` | no | The harness's own session or conversation id, once known. |
+| `harness` | no | The agent program: `claude`, `codex`, `goose`, or any other name. |
+| `model` | no | The model name as given to the harness. |
+| `agent` | no | The role or agent type the session runs as. |
+| `account`, `account_kind` | no | The account the session is spending now. For a subscription login, `account` is the profile name the daemon publishes under `profile/<name>/`, so the two trees join on it. `account_kind` is `subscription` or `api-key`; readers tolerate other values. |
+| `cwd`, `pid` | no | Working directory and process id on `host`. |
+| `title` | no | A short human-readable label; what it is made from is the publisher's choice. |
+| `cost_usd` | no | Dollars spent by this session so far, as the harness estimates them; final on the ended record. Absent when unknown. |
+| `ended_at`, `duration_ms`, `ok` | ended only | `ok` is whether the session's work completed. |
+| `meta` | no | An object of publisher-specific keys. Generic readers show or ignore it; they never interpret it. |
+
+Absent optional fields are omitted, not `null`. A running record may be
+republished with changed fields at any time — a new account after a hand-off,
+a session id once learned, a growing `cost_usd`. Token counts are not
+generic (harnesses count cached and reasoning tokens differently), so they
+belong in `meta`.
+
+An outside grouping looks like this: two top-level sessions, neither with a
+`parent`, sharing a `root` that is neither's `id`:
+
+```json
+{ "v": 1, "id": "a1", "publisher": "ccc", "host": "atlas", "state": "running",
+  "started_at": "2026-11-10T14:00:00Z", "updated_at": "2026-11-10T14:00:00Z",
+  "root": "batch-7" }
+{ "v": 1, "id": "b2", "publisher": "ccc", "host": "zeus", "state": "running",
+  "started_at": "2026-11-10T14:00:01Z", "updated_at": "2026-11-10T14:00:01Z",
+  "root": "batch-7" }
+```
+
+### Account-spend record
+
+One per publisher, host and account: what that publisher on that host has
+spent on that account in the current period.
+
+```json
+{ "v": 1, "account": "team", "account_kind": "api-key", "publisher": "ccc", "host": "atlas",
+  "period": "2026-11", "usd": 137.42, "turns": 212, "unmeasured_turns": 3,
+  "budget_usd": 420.0,
+  "exhausted": { "at": "…", "session": "…", "message": "…" },
+  "cleared_at": "…", "updated_at": "…" }
+```
+
+- `v`, `account`, `account_kind`, `publisher`, `host`, `period`, `usd` and
+  `updated_at` are required; `budget_usd` (the publisher's configured budget,
+  for display), `turns`, `unmeasured_turns`, `exhausted` (with optional
+  `session` and `message`) and `cleared_at` are optional.
+- `period` names the accounting period; publishers of one account must agree
+  on it (for a monthly budget, `YYYY-MM` in the account's refill time zone).
+  Readers combine only records with the same `account` and `period`, so a
+  record left from last month is ignored without anyone clearing it.
+- **Total spend** of an account in a period is the sum of `usd` over every
+  publisher and host.
+- **Exhausted** is true when the newest `exhausted.at` over those records is
+  later than the newest `cleared_at` over them (an absent `cleared_at` is
+  older than everything). A publisher raises the flag in its own record when
+  the provider refuses a turn for spend — the credit is gone, or a spend
+  limit is reached; an operator clears it, from any publisher, by publishing
+  a `cleared_at` there.
+- Sharing an account between tools is a naming convention: two tools that
+  spend the same key publish under the same `account` name. Two hosts of one
+  publisher must have distinct host names, or their levels overwrite each
+  other.
+
+### Reading account spend: publish your level first
+
+A bounded read of retained account records has no end-of-retained signal, so
+it ends on a quiet gap (quiesce) that starts at the first record — and a read
+of an *empty* accounts subtree runs to its timeout. So **a publisher that
+reads account spend publishes its own level first**: its record for each
+account it budgets, a zero level included, waits for the PUBACKs, then
+subscribes. The broker then holds at least that record and the read ends on
+quiesce. A dashboard is a streaming subscriber and has no bounded read to
+protect.
 
 ## Reading the data
 
@@ -414,8 +588,9 @@ crates.io:
 - **`claude-usage-mqtt-core`** — the topic builder/parser and payload schemas.
   The daemon and the client both depend on it, so the wire format cannot drift.
 - **`claude-usage-mqtt-client`** — a small client library (`UsageClient` with
-  `next_event` / `fetch_retained`, and a typed `Event` per topic) plus a
-  `claude-usage` CLI for shell scripts:
+  `next_event` / `fetch_retained`, and a typed `Event` per topic; and
+  `AgentClient`, which publishes into the agent tree and reads account spend
+  back) plus a `claude-usage` CLI for shell scripts:
 
   ```sh
   claude-usage snapshot          # retained tree -> JSON
