@@ -34,6 +34,28 @@ jobs:
           command -v mosquitto
           mosquitto --help | head -1
 
+          # Ubuntu 26.04's apparmor package confines /usr/sbin/mosquitto to
+          # /etc/mosquitto, and the e2e brokers read their config from a temp
+          # dir. Unloading the profile on this throwaway runner is the
+          # expedient fix. TODO(hermetic-build): a mosquitto built and run
+          # from a hermetic build is not covered by the profile.
+          if [ -e /etc/apparmor.d/mosquitto ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/mosquitto \
+              || echo "apparmor_parser -R failed; the probe below decides"
+          fi
+          # The probe reads no AppArmor state (the loaded-profile list is
+          # root-only); it checks that mosquitto can read a conf in a temp
+          # dir. A readable conf with an unknown variable makes it exit at
+          # once; an unreadable one prints "Unable to open config file".
+          probe=$(mktemp -d)
+          echo 'e2e_probe_unknown_variable true' > "$probe/mosquitto.conf"
+          out=$(timeout 10 mosquitto -c "$probe/mosquitto.conf" 2>&1 || true)
+          echo "$out"
+          if grep -q 'Unable to open config file' <<<"$out"; then
+            echo "::error::mosquitto cannot read a config file under $probe: AppArmor still confines /usr/sbin/mosquitto, so the e2e brokers cannot start"
+            exit 1
+          fi
+
       - run: make rust-check
 
   scrub:

@@ -732,4 +732,8 @@ cargo test        # unit + e2e
 The e2e tests spawn a real mosquitto on an ephemeral port and mock the usage
 endpoint in-process, so they never touch `api.anthropic.com` and can assert on
 the exact number of API calls made. They skip if mosquitto is not installed or will
-not start; under CI (`CI` set) they fail instead of quietly skipping.
+not start; under CI (`CI` set) they fail instead of quietly skipping. On
+Ubuntu 26.04 and later, the distribution's AppArmor profile confines mosquitto
+to `/etc/mosquitto`, so the brokers cannot read their temp-dir config and the
+suite skips; `sudo apparmor_parser -R /etc/apparmor.d/mosquitto` lifts the
+profile until the next boot, which is what CI does.

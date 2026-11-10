@@ -4,6 +4,8 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+## 0.3.0 — 2026-11-10
+
 - **New: the agent tree.** Tools that launch Claude agents (such as `ccc`)
   can now publish their running sessions and their spend per account under
   a new subtree, `<prefix>/agents/`, beside the daemon's `daemon/` and
@@ -29,6 +31,9 @@ All notable changes to claude-usage-mqtt are documented in this file.
   subscription filters (`AgentTopics`), the payload types and the rules for
   combining spend and exhaustion across publishers. Existing `Topics` API
   unchanged.
+- CI unloads Ubuntu 26.04's AppArmor profile for mosquitto so that the e2e
+  suite can start its brokers, and the README says how to do the same
+  locally.
 
 ## 0.2.1 — 2026-10-22
 
