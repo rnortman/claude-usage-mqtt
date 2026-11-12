@@ -431,7 +431,7 @@ running and what they have spent on each account. The daemon neither reads,
 writes nor clears it. **This section is the contract**: a tool that cannot
 link the crates (its own MQTT client, a WASM guest) implements it from here.
 `claude-usage-mqtt-core` (`AgentTopics`, `SessionRecord`, `AccountSpend`,
-`total_usd`, `exhausted`) and `claude-usage-mqtt-client` (`AgentClient`) are
+`total_usd`, `exhausted`, `exhausted_buckets`) and `claude-usage-mqtt-client` (`AgentClient`) are
 one implementation of it.
 
 The tree requires an **MQTT 5 broker**: liveness rests on message expiry.
@@ -546,20 +546,73 @@ spent on that account in the current period.
 
 - `v`, `account`, `account_kind`, `publisher`, `host`, `period`, `usd` and
   `updated_at` are required; `budget_usd` (the publisher's configured budget,
-  for display), `turns`, `unmeasured_turns`, `exhausted` (with optional
-  `session` and `message`) and `cleared_at` are optional.
+  for display), `turns`, `unmeasured_turns`, `exhausted`,
+  `exhausted_buckets` and `cleared_at` are optional.
 - `period` names the accounting period; publishers of one account must agree
   on it (for a monthly budget, `YYYY-MM` in the account's refill time zone).
   Readers combine only records with the same `account` and `period`, so a
   record left from last month is ignored without anyone clearing it.
 - **Total spend** of an account in a period is the sum of `usd` over every
   publisher and host.
-- **Exhausted** is true when the newest `exhausted.at` over those records is
-  later than the newest `cleared_at` over them (an absent `cleared_at` is
-  older than everything). A publisher raises the flag in its own record when
-  the provider refuses a turn for spend — the credit is gone, or a spend
-  limit is reached; an operator clears it, from any publisher, by publishing
-  a `cleared_at` there.
+
+#### Exhausted flags
+
+A publisher raises a flag in its own record when the provider refuses a turn
+for spend or quota — the credit is gone, a spend limit is reached, a usage
+window is used up. A flag is an object:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `at` | yes | When the refusal was seen. |
+| `session` | no | The publisher's `id` of the session whose turn was refused. |
+| `message` | no | The provider's message. |
+| `until` | no | When the provider said the refusal ends. |
+| `kind` | no | The provider's own name for the limit that refused the turn (for Claude, `rateLimitType`); for display and diagnosis, never interpreted by readers. |
+
+A record carries flags in two places:
+
+- `exhausted`, the **account-wide** flag: every bucket of the account is
+  exhausted. An account with no buckets, such as an API key, has only this.
+- `exhausted_buckets`, an object from **bucket** name to flag. A bucket is a
+  named quota within the account. Bucket names are topic-safe strings the
+  publishers of one account agree on, as they agree on `period`.
+
+`cleared_at` is the only clear: an operator publishes it, through any
+publisher, and it lifts every flag of the account, account-wide and bucket
+alike.
+
+Whether an account is **exhausted** in a period for a bucket, at the reader's
+clock `now`, over the records of that account and period:
+
+1. The flags that apply are every record's `exhausted` and, when a bucket is
+   asked about, every record's `exhausted_buckets[<bucket>]`. Asked about no
+   bucket, only the account-wide flags apply.
+2. A flag is **lifted** when any record's `cleared_at` is at or after the
+   flag's `at` (an absent `cleared_at` lifts nothing).
+3. A flag is **expired** when it has an `until` and `until <= now`.
+4. The account is exhausted when a flag remains; the one reported is the one
+   with the newest `at`.
+
+For records with neither `until` nor `exhausted_buckets` this is "the newest
+`exhausted.at` is later than the newest `cleared_at`".
+
+**Subscription accounts.** A subscription account's record uses the fixed
+period `-`, and `usd: 0` when its publisher does not track spend on it. The
+bucket names in use are `five_hour` (the 5-hour window), `general` (the weekly
+quota every model draws on) and `fable` (the weekly Fable quota):
+
+```json
+{ "v": 1, "account": "team01", "account_kind": "subscription",
+  "publisher": "ccc", "host": "atlas", "period": "-", "usd": 0.0,
+  "exhausted_buckets": {
+    "fable": { "at": "2026-11-11T13:46:07Z", "session": "416f28da",
+               "message": "You've reached your Fable limit. …",
+               "until": "2026-11-13T04:00:00Z",
+               "kind": "seven_day_overage_included" } },
+  "cleared_at": "2026-11-10T09:00:00Z",
+  "updated_at": "2026-11-11T13:46:07Z" }
+```
+
 - Sharing an account between tools is a naming convention: two tools that
   spend the same key publish under the same `account` name. Two hosts of one
   publisher must have distinct host names, or their levels overwrite each

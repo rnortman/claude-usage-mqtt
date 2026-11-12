@@ -17,6 +17,8 @@
 //! is what is running. Readers ignore fields they do not know; `v` changes
 //! only for an incompatible change; publisher-specific data goes under `meta`.
 
+use std::collections::BTreeMap;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -275,7 +277,8 @@ impl SessionRecord {
     }
 }
 
-/// The last refusal a publisher saw for spend on an account.
+/// The last refusal a publisher saw for spend on an account, or on one
+/// bucket of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Exhausted {
@@ -286,14 +289,25 @@ pub struct Exhausted {
     /// The provider's message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// When the provider said the refusal ends. A flag whose `until` is at or
+    /// before the reader's clock is not in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
+    /// The provider's own name for the limit that refused the turn, for
+    /// display and diagnosis. Readers never interpret it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl Exhausted {
+    /// A flag with no `until` and no `kind`.
     pub fn new(at: Timestamp, session: Option<String>, message: Option<String>) -> Self {
         Self {
             at,
             session,
             message,
+            until: None,
+            kind: None,
         }
     }
 }
@@ -320,10 +334,16 @@ pub struct AccountSpend {
     /// The publisher's configured budget, for display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
+    /// The account-wide flag: every bucket of the account is exhausted. An
+    /// account with no buckets, such as an API key, has only this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhausted: Option<Exhausted>,
-    /// When an operator last cleared the exhausted flag through this
-    /// publisher-and-host.
+    /// One flag per bucket, a named quota within the account. Publishers of
+    /// one account agree on the bucket names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exhausted_buckets: BTreeMap<String, Exhausted>,
+    /// When an operator last cleared the account's flags, account-wide and
+    /// bucket alike, through this publisher-and-host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_at: Option<Timestamp>,
     pub updated_at: Timestamp,
@@ -352,6 +372,7 @@ impl AccountSpend {
             unmeasured_turns: None,
             budget_usd: None,
             exhausted: None,
+            exhausted_buckets: BTreeMap::new(),
             cleared_at: None,
             updated_at,
         }
@@ -375,25 +396,68 @@ pub fn total_usd(records: &[AccountSpend], account: &str, period: &str) -> f64 {
     of(records, account, period).map(|r| r.usd).sum()
 }
 
-/// Whether `account` is exhausted in `period`: the newest `exhausted` flag
-/// over its records, when that flag's `at` is later than the newest
-/// `cleared_at` over them (an absent `cleared_at` is older than everything).
-/// `None` when it is not exhausted.
+/// The newest flag of `flags` in force over the records of one account and
+/// period: neither lifted by any record's `cleared_at` at or after its `at`,
+/// nor expired by an `until` at or before `now`.
+fn in_force<'a>(
+    flags: impl Iterator<Item = &'a Exhausted>,
+    newest_clear: Option<Timestamp>,
+    now: Timestamp,
+) -> Option<&'a Exhausted> {
+    flags
+        .filter(|e| newest_clear.is_none_or(|c| c < e.at))
+        .filter(|e| e.until.is_none_or(|u| u > now))
+        .max_by_key(|e| e.at)
+}
+
+fn newest_clear(records: &[AccountSpend], account: &str, period: &str) -> Option<Timestamp> {
+    of(records, account, period)
+        .filter_map(|r| r.cleared_at)
+        .max()
+}
+
+/// Whether `account` is exhausted in `period` for `bucket` at `now`.
+///
+/// The flags that apply are every record's account-wide `exhausted` and, for
+/// `Some(b)`, every record's `exhausted_buckets[b]`. A flag is lifted when any
+/// record's `cleared_at` is at or after its `at`, and expired when it has an
+/// `until` at or before `now`. The answer is the flag with the newest `at`
+/// among the rest; `None` when there is none.
 pub fn exhausted<'a>(
     records: &'a [AccountSpend],
     account: &str,
     period: &str,
+    bucket: Option<&str>,
+    now: Timestamp,
 ) -> Option<&'a Exhausted> {
-    let newest_flag = of(records, account, period)
-        .filter_map(|r| r.exhausted.as_ref())
-        .max_by_key(|e| e.at)?;
-    let newest_clear = of(records, account, period)
-        .filter_map(|r| r.cleared_at)
-        .max();
-    match newest_clear {
-        Some(c) if c >= newest_flag.at => None,
-        _ => Some(newest_flag),
+    let flags = of(records, account, period).flat_map(|r| {
+        r.exhausted
+            .iter()
+            .chain(bucket.and_then(|b| r.exhausted_buckets.get(b)))
+    });
+    in_force(flags, newest_clear(records, account, period), now)
+}
+
+/// Every bucket of `account` in `period` with a flag of its own in force at
+/// `now`, by the rules of [`exhausted`], mapped to that flag. Account-wide
+/// flags are not included. For display.
+pub fn exhausted_buckets<'a>(
+    records: &'a [AccountSpend],
+    account: &str,
+    period: &str,
+    now: Timestamp,
+) -> BTreeMap<&'a str, &'a Exhausted> {
+    let clear = newest_clear(records, account, period);
+    let mut by_bucket: BTreeMap<&'a str, Vec<&'a Exhausted>> = BTreeMap::new();
+    for r in of(records, account, period) {
+        for (b, e) in &r.exhausted_buckets {
+            by_bucket.entry(b.as_str()).or_default().push(e);
+        }
     }
+    by_bucket
+        .into_iter()
+        .filter_map(|(b, flags)| in_force(flags.into_iter(), clear, now).map(|e| (b, e)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -650,6 +714,7 @@ mod tests {
             "unmeasured_turns",
             "budget_usd",
             "exhausted",
+            "exhausted_buckets",
             "cleared_at",
         ] {
             assert!(json.get(absent).is_none(), "{absent}: {json}");
@@ -667,6 +732,44 @@ mod tests {
         s.cleared_at = Some(ts("2026-11-09T00:00:00Z"));
         let back: AccountSpend = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+
+        let mut fable = Exhausted::new(
+            ts("2026-11-11T13:46:07Z"),
+            Some("416f28da".into()),
+            Some("You've reached your Fable limit.".into()),
+        );
+        fable.until = Some(ts("2026-11-13T04:00:00Z"));
+        fable.kind = Some("seven_day_overage_included".into());
+        s.exhausted_buckets.insert("fable".into(), fable);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            json["exhausted_buckets"]["fable"]["until"],
+            "2026-11-13T04:00:00Z"
+        );
+        assert_eq!(
+            json["exhausted_buckets"]["fable"]["kind"],
+            "seven_day_overage_included"
+        );
+        // The account-wide flag has neither `until` nor `kind`.
+        assert!(json["exhausted"].get("until").is_none(), "{json}");
+        assert!(json["exhausted"].get("kind").is_none(), "{json}");
+        let back: AccountSpend = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn a_record_without_the_bucket_fields_decodes_as_before() {
+        let s: AccountSpend = serde_json::from_str(
+            r#"{"v":1,"account":"team","account_kind":"api-key","publisher":"ccc",
+                "host":"h","period":"2026-11","usd":1.5,"updated_at":"2026-11-10T14:03:11Z",
+                "exhausted":{"at":"2026-11-10T14:00:00Z","message":"no credit"}}"#,
+        )
+        .unwrap();
+        assert!(s.exhausted_buckets.is_empty());
+        let e = s.exhausted.unwrap();
+        assert_eq!(e.until, None);
+        assert_eq!(e.kind, None);
+        assert_eq!(e.message.as_deref(), Some("no credit"));
     }
 
     #[test]
@@ -708,23 +811,29 @@ mod tests {
         s
     }
 
+    /// A clock earlier than every flag in these tests, so nothing expires.
+    fn early() -> Timestamp {
+        ts("2026-01-01T00:00:00Z")
+    }
+
     #[test]
     fn exhausted_follows_the_newest_flag_against_the_newest_clear() {
         let a = || spend("ccc", "atlas", "team", "2026-11", 1.0);
         let b = || spend("brenn", "h", "team", "2026-11", 1.0);
         let c = || spend("ccc", "boreas", "team", "2026-11", 1.0);
+        let ex = |r: &[AccountSpend]| exhausted(r, "team", "2026-11", None, early()).cloned();
 
-        assert!(exhausted(&[a(), b()], "team", "2026-11").is_none());
+        assert!(ex(&[a(), b()]).is_none());
 
         let r = [a(), flagged(b(), "2026-11-10T10:00:00Z")];
-        assert!(exhausted(&r, "team", "2026-11").is_some());
+        assert!(ex(&r).is_some());
 
         // A newer clear from another publisher outranks it.
         let r = [
             cleared(a(), "2026-11-10T11:00:00Z"),
             flagged(b(), "2026-11-10T10:00:00Z"),
         ];
-        assert!(exhausted(&r, "team", "2026-11").is_none());
+        assert!(ex(&r).is_none());
 
         // A flag newer than that clear exhausts it again; the newest flag is
         // the one reported.
@@ -733,7 +842,7 @@ mod tests {
             flagged(b(), "2026-11-10T10:00:00Z"),
             flagged(c(), "2026-11-10T12:00:00Z"),
         ];
-        let e = exhausted(&r, "team", "2026-11").unwrap();
+        let e = ex(&r).unwrap();
         assert_eq!(e.at, ts("2026-11-10T12:00:00Z"));
 
         // Flags of another period or account do not count.
@@ -747,6 +856,151 @@ mod tests {
                 "2026-11-10T10:00:00Z",
             ),
         ];
-        assert!(exhausted(&r, "team", "2026-11").is_none());
+        assert!(ex(&r).is_none());
+
+        // A clear at exactly the flag's `at` lifts it.
+        let r = [
+            cleared(a(), "2026-11-10T10:00:00Z"),
+            flagged(b(), "2026-11-10T10:00:00Z"),
+        ];
+        assert!(ex(&r).is_none());
+    }
+
+    fn sub(host: &str) -> AccountSpend {
+        AccountSpend::new(
+            "team01",
+            AccountKind::Subscription,
+            "ccc",
+            host,
+            "-",
+            0.0,
+            ts("2026-11-11T14:00:00Z"),
+        )
+    }
+
+    fn bucket(mut s: AccountSpend, b: &str, at: &str, until: Option<&str>) -> AccountSpend {
+        let mut e = Exhausted::new(ts(at), None, Some(format!("{b} {at}")));
+        e.until = until.map(ts);
+        s.exhausted_buckets.insert(b.into(), e);
+        s
+    }
+
+    #[test]
+    fn a_bucket_flag_applies_to_its_bucket_only() {
+        let r = [bucket(sub("atlas"), "fable", "2026-11-11T13:00:00Z", None)];
+        let now = ts("2026-11-11T14:00:00Z");
+        assert!(exhausted(&r, "team01", "-", Some("fable"), now).is_some());
+        assert!(exhausted(&r, "team01", "-", Some("general"), now).is_none());
+        assert!(exhausted(&r, "team01", "-", None, now).is_none());
+        assert!(exhausted(&r, "team01", "other-period", Some("fable"), now).is_none());
+    }
+
+    #[test]
+    fn an_account_wide_flag_applies_to_every_bucket() {
+        let r = [flagged(sub("atlas"), "2026-11-11T13:00:00Z")];
+        let now = ts("2026-11-11T14:00:00Z");
+        for b in [None, Some("fable"), Some("general"), Some("five_hour")] {
+            assert!(exhausted(&r, "team01", "-", b, now).is_some(), "{b:?}");
+        }
+        // The newest of the account-wide and the bucket flag is reported.
+        let r = [
+            flagged(sub("atlas"), "2026-11-11T13:00:00Z"),
+            bucket(sub("boreas"), "fable", "2026-11-11T13:30:00Z", None),
+        ];
+        let e = exhausted(&r, "team01", "-", Some("fable"), now).unwrap();
+        assert_eq!(e.at, ts("2026-11-11T13:30:00Z"));
+        let e = exhausted(&r, "team01", "-", Some("general"), now).unwrap();
+        assert_eq!(e.at, ts("2026-11-11T13:00:00Z"));
+    }
+
+    #[test]
+    fn any_clear_lifts_every_flag_older_than_it() {
+        let now = ts("2026-11-11T14:00:00Z");
+        let r = [
+            flagged(
+                bucket(sub("atlas"), "fable", "2026-11-11T12:00:00Z", None),
+                "2026-11-11T12:10:00Z",
+            ),
+            bucket(sub("boreas"), "five_hour", "2026-11-11T12:20:00Z", None),
+            cleared(sub("zeus"), "2026-11-11T12:30:00Z"),
+        ];
+        for b in [None, Some("fable"), Some("five_hour"), Some("general")] {
+            assert!(exhausted(&r, "team01", "-", b, now).is_none(), "{b:?}");
+        }
+        assert!(exhausted_buckets(&r, "team01", "-", now).is_empty());
+
+        // A bucket flag newer than the clear is in force again, alone.
+        let mut r = r.to_vec();
+        r.push(bucket(sub("hermes"), "fable", "2026-11-11T13:00:00Z", None));
+        let e = exhausted(&r, "team01", "-", Some("fable"), now).unwrap();
+        assert_eq!(e.at, ts("2026-11-11T13:00:00Z"));
+        assert!(exhausted(&r, "team01", "-", Some("five_hour"), now).is_none());
+        assert!(exhausted(&r, "team01", "-", None, now).is_none());
+    }
+
+    #[test]
+    fn a_flag_expires_at_its_until() {
+        let until = "2026-11-13T04:00:00Z";
+        let r = [bucket(
+            sub("atlas"),
+            "fable",
+            "2026-11-11T13:00:00Z",
+            Some(until),
+        )];
+        let before = ts("2026-11-13T03:59:59Z");
+        assert!(exhausted(&r, "team01", "-", Some("fable"), before).is_some());
+        assert!(exhausted(&r, "team01", "-", Some("fable"), ts(until)).is_none());
+        assert!(exhausted(&r, "team01", "-", Some("fable"), ts("2026-11-14T00:00:00Z")).is_none());
+
+        // An expired newest flag does not hide an older one still in force.
+        let r = [
+            bucket(
+                sub("atlas"),
+                "fable",
+                "2026-11-11T10:00:00Z",
+                Some("2026-11-13T04:00:00Z"),
+            ),
+            bucket(
+                sub("boreas"),
+                "fable",
+                "2026-11-11T12:00:00Z",
+                Some("2026-11-11T13:00:00Z"),
+            ),
+        ];
+        let e = exhausted(&r, "team01", "-", Some("fable"), ts("2026-11-11T14:00:00Z")).unwrap();
+        assert_eq!(e.at, ts("2026-11-11T10:00:00Z"));
+        assert_eq!(
+            exhausted_buckets(&r, "team01", "-", ts("2026-11-11T14:00:00Z"))["fable"].at,
+            ts("2026-11-11T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn exhausted_buckets_lists_exactly_the_buckets_in_force() {
+        let now = ts("2026-11-11T14:00:00Z");
+        let r = [
+            bucket(
+                bucket(sub("atlas"), "fable", "2026-11-11T13:00:00Z", None),
+                "five_hour",
+                "2026-11-11T09:00:00Z",
+                Some("2026-11-11T11:00:00Z"),
+            ),
+            flagged(
+                bucket(sub("boreas"), "general", "2026-11-11T12:00:00Z", None),
+                "2026-11-11T12:00:00Z",
+            ),
+            bucket(sub("boreas"), "general", "2026-11-11T12:30:00Z", None),
+            bucket(
+                spend("ccc", "atlas", "other", "-", 0.0),
+                "weekly",
+                "2026-11-11T12:00:00Z",
+                None,
+            ),
+        ];
+        let m = exhausted_buckets(&r, "team01", "-", now);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), ["fable", "general"]);
+        assert_eq!(m["fable"].at, ts("2026-11-11T13:00:00Z"));
+        assert_eq!(m["general"].at, ts("2026-11-11T12:30:00Z"));
+        assert!(exhausted_buckets(&[], "team01", "-", now).is_empty());
     }
 }

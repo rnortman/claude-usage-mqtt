@@ -11,7 +11,7 @@ mod window;
 
 pub use agents::{
     AGENT_TREE_VERSION, AccountKind, AccountSpend, AgentTopics, Exhausted, ParsedAgentTopic,
-    SessionRecord, SessionState, exhausted, total_usd,
+    SessionRecord, SessionState, exhausted, exhausted_buckets, total_usd,
 };
 pub use mqtt_config::{
     KEEP_ALIVE_RANGE_S, MqttConfig, PASSWORD_ENV, check_keep_alive, expand_tilde, resolve_password,

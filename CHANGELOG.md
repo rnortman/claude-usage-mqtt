@@ -4,6 +4,22 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+- **Bucket-specific exhausted flags in the agent tree.** An account-spend
+  record can now flag one quota of an account rather than the whole account:
+  `exhausted_buckets` maps a bucket name to a flag, and a flag can carry
+  `until` (when the provider said the refusal ends; the flag is not in force
+  from then on) and `kind` (the provider's name for the limit). The existing
+  `exhausted` is the account-wide flag and `cleared_at` still clears every
+  flag of the account. The README's "Account-spend record" gives the rule and
+  the convention for subscription accounts (period `-`, buckets `five_hour`,
+  `general`, `fable`). Records without the new fields read as before, and
+  readers on 0.3.0 ignore them.
+- **Breaking for library users:** `claude-usage-mqtt-core::exhausted` takes
+  the bucket asked about (`None` for account-wide flags only) and the
+  reader's clock: `exhausted(records, account, period, bucket, now)`. The new
+  `exhausted_buckets(records, account, period, now)` lists every bucket with
+  a flag of its own in force.
+
 ## 0.3.0 — 2026-11-10
 
 - **New: the agent tree.** Tools that launch Claude agents (such as `ccc`)
