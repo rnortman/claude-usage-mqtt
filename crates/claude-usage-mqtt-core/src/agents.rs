@@ -191,7 +191,8 @@ impl From<AccountKind> for String {
 #[non_exhaustive]
 pub struct SessionRecord {
     pub v: u32,
-    /// Unique within the publisher; the topic's last segment.
+    /// Unique within the publisher among running sessions; an ended id may
+    /// run again (see the README, "Session record"). The topic's last segment.
     pub id: String,
     pub publisher: String,
     pub host: String,
@@ -225,7 +226,8 @@ pub struct SessionRecord {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Dollars spent so far, as the harness estimates them.
+    /// Dollars spent by this run of the session so far, as the harness
+    /// estimates them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

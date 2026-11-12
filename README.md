@@ -485,6 +485,14 @@ publishes are QoS 1.
 A *session* is the publisher's own unit of running agent work — for `ccc` an
 invocation, for brenn a conversation.
 
+The `id` names that unit, not one run of it. A unit that stops and later
+runs again — a brenn conversation that sleeps and wakes — runs again under
+the same `id`: the publisher publishes its ended record and withdraws the
+retained one, and later publishes a new running record on the same topic.
+`started_at`, `ended_at`, `duration_ms`, `ok` and `cost_usd` describe one
+run. A reader that wants figures for the unit's lifetime sums the ended
+records of one `id`, and never treats an ended `id` as gone for good.
+
 ```json
 { "v": 1, "id": "…", "publisher": "ccc", "host": "atlas", "state": "running",
   "started_at": "…", "updated_at": "…",
@@ -499,7 +507,7 @@ invocation, for brenn a conversation.
 
 | Field | Required | Meaning, the same for every harness |
 |---|---|---|
-| `v`, `id`, `publisher`, `host`, `state`, `started_at`, `updated_at` | yes | `id` is unique within the publisher; `publisher` and `host` repeat the topic; `state` is `running` or `ended`. Timestamps are RFC 3339. |
+| `v`, `id`, `publisher`, `host`, `state`, `started_at`, `updated_at` | yes | `id` is unique within the publisher among running sessions; an ended `id` may run again (above); `publisher` and `host` repeat the topic; `state` is `running` or `ended`. Timestamps are RFC 3339. |
 | `parent` | no | `id` of the session that launched this one, same publisher, any host. |
 | `root` | no | An opaque identifier shared by every session of one tree, from one publisher; readers group a tree by `publisher` and `root`. For a tree started by a session with no outside grouping it is that session's `id`. A publisher may instead take it from outside — several top-level sessions launched as one group — so a reader must not assume that a session with `id == root` exists, or that a tree has exactly one session without a `parent`. |
 | `session` | no | The harness's own session or conversation id, once known. |
@@ -509,7 +517,7 @@ invocation, for brenn a conversation.
 | `account`, `account_kind` | no | The account the session is spending now. For a subscription login, `account` is the profile name the daemon publishes under `profile/<name>/`, so the two trees join on it. `account_kind` is `subscription` or `api-key`; readers tolerate other values. |
 | `cwd`, `pid` | no | Working directory and process id on `host`. |
 | `title` | no | A short human-readable label; what it is made from is the publisher's choice. |
-| `cost_usd` | no | Dollars spent by this session so far, as the harness estimates them; final on the ended record. Absent when unknown. |
+| `cost_usd` | no | Dollars spent by this run of the session so far, as the harness estimates them; final on the ended record. Absent when unknown. |
 | `ended_at`, `duration_ms`, `ok` | ended only | `ok` is whether the session's work completed. |
 | `meta` | no | An object of publisher-specific keys. Generic readers show or ignore it; they never interpret it. |
 
@@ -577,9 +585,18 @@ A record carries flags in two places:
   named quota within the account. Bucket names are topic-safe strings the
   publishers of one account agree on, as they agree on `period`.
 
-`cleared_at` is the only clear: an operator publishes it, through any
-publisher, and it lifts every flag of the account, account-wide and bucket
-alike.
+`cleared_at` is the only way to lift a flag in **another** record: an
+operator publishes it, through any publisher, and it lifts every flag of the
+account, account-wide and bucket alike.
+
+A publisher may also **withdraw a flag from its own record**, by
+republishing the record without it, once it has seen a turn succeed on the
+account, or once the flag's `until` has passed. A withdrawal is not a clear:
+it sets no `cleared_at` and changes no other record, so a flag another
+publisher raised on the same account stays in force. A record that carries
+no flag contributes none to the rule below. A reader therefore takes each
+record's flags as that publisher's current assertion and does not latch a
+flag it saw earlier until a `cleared_at` arrives.
 
 Whether an account is **exhausted** in a period for a bucket, at the reader's
 clock `now`, over the records of that account and period:

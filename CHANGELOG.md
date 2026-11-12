@@ -4,6 +4,14 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+- **Agent-tree contract clarified for brenn as a publisher.** The README now
+  states two rules the contract relied on without saying: a publisher may withdraw a flag from its own account-spend
+  record after a turn succeeds on the account (or once the flag's `until` has
+  passed), without publishing `cleared_at`; and a session `id` that has ended
+  may run again, with `started_at`, `ended_at`, `duration_ms`, `ok` and
+  `cost_usd` describing one run. No wire or library change. Readers written
+  from the README should not latch flags or retire ended ids.
+
 ## 0.4.0 — 2026-11-12
 
 - **Bucket-specific exhausted flags in the agent tree.** An account-spend
