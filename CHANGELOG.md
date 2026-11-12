@@ -4,6 +4,8 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+## 0.4.0 — 2026-11-12
+
 - **Bucket-specific exhausted flags in the agent tree.** An account-spend
   record can now flag one quota of an account rather than the whole account:
   `exhausted_buckets` maps a bucket name to a flag, and a flag can carry
