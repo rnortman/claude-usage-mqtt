@@ -97,6 +97,20 @@ pub struct Snapshot {
     pub stale_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_type: Option<String>,
+    /// When the profile's current access token expires (`expiresAt` in the
+    /// credentials file), as of the daemon's last read of that file. The token
+    /// lives hours and is renewed automatically, so a near or past value is
+    /// routine — not something to warn on. Absent when the file does not carry
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token_expires_at: Option<Timestamp>,
+    /// When the profile's login itself expires (`refreshTokenExpiresAt` in the
+    /// credentials file), as of the daemon's last read of that file. After this
+    /// instant the access token can no longer be renewed and the profile needs
+    /// an interactive re-login: this is the expiry to warn on. Absent when the
+    /// file does not carry it or it is not an integer millisecond timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_at: Option<Timestamp>,
     pub windows: Vec<Window>,
 }
 
@@ -202,6 +216,46 @@ mod tests {
         assert_eq!(s.auth, AuthState::Ok);
         assert!(s.stale_reason.is_none());
         assert!(s.subscription_type.is_none());
+        assert!(s.access_token_expires_at.is_none());
+        assert!(s.refresh_token_expires_at.is_none());
+    }
+
+    fn snapshot_with_expiries(access: Option<Timestamp>, refresh: Option<Timestamp>) -> Snapshot {
+        Snapshot {
+            profile: "p".into(),
+            auth: AuthState::Ok,
+            updated_at: Timestamp::from_second(1).unwrap(),
+            next_poll_at: Timestamp::from_second(2).unwrap(),
+            poll_interval_s: 480,
+            stale_reason: None,
+            subscription_type: None,
+            access_token_expires_at: access,
+            refresh_token_expires_at: refresh,
+            windows: vec![],
+        }
+    }
+
+    #[test]
+    fn snapshot_expiries_round_trip_as_rfc3339() {
+        let access = Timestamp::from_second(1_800_000_000).unwrap();
+        let refresh = Timestamp::from_second(1_802_000_000).unwrap();
+        let json =
+            serde_json::to_string(&snapshot_with_expiries(Some(access), Some(refresh))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["access_token_expires_at"], "2027-01-15T08:00:00Z");
+        assert_eq!(v["refresh_token_expires_at"], "2027-02-07T11:33:20Z");
+        let back: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.access_token_expires_at, Some(access));
+        assert_eq!(back.refresh_token_expires_at, Some(refresh));
+    }
+
+    #[test]
+    fn snapshot_without_expiries_omits_the_keys() {
+        let json = serde_json::to_string(&snapshot_with_expiries(None, None)).unwrap();
+        assert!(
+            !json.contains("expires_at"),
+            "absent expiries must be omitted, not serialized: {json}"
+        );
     }
 
     #[test]

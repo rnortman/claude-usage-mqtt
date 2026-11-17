@@ -219,6 +219,8 @@ limits, so subscribe with a wildcard rather than hardcoding the list.
   "next_poll_at": "2026-07-17T13:59:42Z",
   "poll_interval_s": 480,
   "subscription_type": "max",
+  "access_token_expires_at": "2026-07-17T21:40:03Z",
+  "refresh_token_expires_at": "2026-08-14T13:40:03Z",
   "windows": [
     {"key":"five_hour","label":"5-hour","utilization":42.5,"resets_at":"2026-07-17T18:51:42Z"},
     {"key":"7-day_opus_4_8","label":"7-day (Opus 4.8)","utilization":61.0,"resets_at":"..."}
@@ -252,6 +254,8 @@ with an honest reason beats no number.
 absent, and `stale_since` duplicated `updated_at`. Deploy 0.2.0 `claude-usage`
 and `watchdog` before the 0.2.0 daemon — a 0.1.0 client cannot decode a 0.2.0
 snapshot, while a 0.2.0 client reads a 0.1.0 snapshot unchanged.
+The expiry fields (`access_token_expires_at`, `refresh_token_expires_at`) are
+additive: clients from 0.2.0 on ignore them.
 
 The `auth` value distinguishes four states, each with a different fix:
 
@@ -266,6 +270,25 @@ The `auth` value distinguishes four states, each with a different fix:
   per refused token in case it can renew, but this usually needs an interactive
   re-login. The daemon remembers the rejected token and stops re-spending API
   calls on it until the credentials file changes.
+
+The two expiry fields come from the profile's `.credentials.json`, read without
+an API call:
+
+- `access_token_expires_at` (`expiresAt` in the file) — when the current access
+  token expires. It is a few hours away at most and renews itself whenever the
+  profile is used or the daemon refreshes it, so a near or past value is routine.
+  **Do not alert on it.**
+- `refresh_token_expires_at` (`refreshTokenExpiresAt` in the file) — when the
+  login itself expires. After this instant the access token can no longer be
+  renewed and the profile needs an interactive re-login. **This is the one to
+  alert on.**
+
+Both are as of the daemon's last read of the credentials file for this publish,
+not as of `updated_at`. Either is absent when the file does not carry it (or,
+for `refresh_token_expires_at`, carries something other than an integer
+millisecond timestamp), and both are absent while `auth` is `missing`; treat
+absence as "not known". The credentials file is Claude Code's and is not
+documented by Anthropic, so the values are published as found.
 
 The `auth` topic is written only when the value changes, and a write the broker
 does not accept is not retried immediately: the daemon re-attempts it the next

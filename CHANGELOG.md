@@ -4,6 +4,17 @@ All notable changes to claude-usage-mqtt are documented in this file.
 
 ## Unreleased
 
+- **Credential expiries in the snapshot.** The per-profile snapshot gains two
+  optional RFC 3339 fields read from the profile's `.credentials.json`:
+  `access_token_expires_at` (`expiresAt`; the short-lived access token, which
+  renews itself — not something to alert on) and `refresh_token_expires_at`
+  (`refreshTokenExpiresAt`; when the login itself expires and the profile
+  will need an interactive re-login — the one to alert on). Each is absent
+  when the file does not carry it. Additive on the wire: clients from 0.2.0
+  on ignore them. Reading them costs no API call.
+- **Breaking for library users:** code that constructs
+  `claude_usage_mqtt_core::Snapshot` with a struct literal must name the two
+  new fields, `access_token_expires_at` and `refresh_token_expires_at`.
 - **Agent-tree contract clarified for brenn as a publisher.** The README now
   states two rules the contract relied on without saying: a publisher may withdraw a flag from its own account-spend
   record after a turn succeeds on the account (or once the flag's `until` has

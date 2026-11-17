@@ -319,6 +319,25 @@ impl MockUsage {
     }
 }
 
+/// Write a fixture `.credentials.json` at `file`: `token` expiring
+/// `expires_in_h` hours from now, and a refresh token expiring four weeks out.
+/// Both instants fall on a whole second so the published RFC 3339 values
+/// compare exactly.
+fn write_creds(file: &std::path::Path, token: &str, expires_in_h: i64) {
+    let now_s = jiff::Timestamp::now().as_second();
+    let exp_ms = (now_s + expires_in_h * 3600) * 1000;
+    let refresh_ms = (now_s + 28 * 86_400) * 1000;
+    std::fs::write(
+        file,
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{token}","refreshToken":"rt",
+               "expiresAt":{exp_ms},"refreshTokenExpiresAt":{refresh_ms},
+               "subscriptionType":"max"}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
 /// Profile fixtures on disk.
 pub struct Profiles {
     pub dir: tempfile::TempDir,
@@ -334,15 +353,11 @@ impl Profiles {
     pub fn add(&self, name: &str, expires_in_h: i64) -> PathBuf {
         let p = self.dir.path().join(name);
         std::fs::create_dir_all(&p).unwrap();
-        let exp_ms = (jiff::Timestamp::now().as_second() + expires_in_h * 3600) * 1000;
-        std::fs::write(
-            p.join(".credentials.json"),
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"tok-{name}","refreshToken":"rt",
-                   "expiresAt":{exp_ms},"subscriptionType":"max"}}}}"#
-            ),
-        )
-        .unwrap();
+        write_creds(
+            &p.join(".credentials.json"),
+            &format!("tok-{name}"),
+            expires_in_h,
+        );
         // A real credentials file is written when its token is issued, so it is
         // as old as the token. The daemon reads the mtime to tell "nobody has
         // touched this profile in hours" from "a session is starting up right
@@ -361,15 +376,19 @@ impl Profiles {
     /// live) — the rotated-token, self-healing case.
     pub fn set_token(&self, name: &str, token: &str, expires_in_h: i64) {
         let p = self.dir.path().join(name);
-        let exp_ms = (jiff::Timestamp::now().as_second() + expires_in_h * 3600) * 1000;
-        std::fs::write(
-            p.join(".credentials.json"),
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"{token}","refreshToken":"rt",
-                   "expiresAt":{exp_ms},"subscriptionType":"max"}}}}"#
-            ),
-        )
-        .unwrap();
+        write_creds(&p.join(".credentials.json"), token, expires_in_h);
+    }
+
+    /// The `expiresAt` and `refreshTokenExpiresAt` a profile's fixture file
+    /// currently carries, as instants.
+    pub fn expiries(&self, name: &str) -> (jiff::Timestamp, jiff::Timestamp) {
+        let raw =
+            std::fs::read_to_string(self.dir.path().join(name).join(".credentials.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let at = |key: &str| {
+            jiff::Timestamp::from_millisecond(v["claudeAiOauth"][key].as_i64().unwrap()).unwrap()
+        };
+        (at("expiresAt"), at("refreshTokenExpiresAt"))
     }
 
     /// Replace a profile's credentials file with unparseable bytes — the

@@ -525,6 +525,8 @@ mod tests {
                 Some("token expired".into())
             },
             subscription_type: None,
+            access_token_expires_at: None,
+            refresh_token_expires_at: None,
             windows: vec![Window {
                 key: "five_hour".into(),
                 label: "5-hour".into(),

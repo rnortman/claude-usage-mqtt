@@ -274,6 +274,8 @@ async fn snapshot_decodes_the_retained_tree() {
             poll_interval_s: 480,
             stale_reason: None,
             subscription_type: Some("max".into()),
+            access_token_expires_at: None,
+            refresh_token_expires_at: None,
             windows: vec![Window {
                 key: "five_hour".into(),
                 label: "5-hour".into(),

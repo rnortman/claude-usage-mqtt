@@ -33,6 +33,24 @@ struct OauthBlock {
     expires_at: Option<i64>,
     #[serde(rename = "subscriptionType")]
     subscription_type: Option<String>,
+    /// Milliseconds since the Unix epoch. Informational only, so parsed
+    /// leniently: any non-integer value becomes `None` instead of failing the
+    /// whole file, which would classify a healthy profile `Unreadable`.
+    #[serde(
+        rename = "refreshTokenExpiresAt",
+        default,
+        deserialize_with = "lenient_millis"
+    )]
+    refresh_token_expires_at: Option<i64>,
+}
+
+/// Accept any JSON value; keep it only if it is an integer that fits `i64`.
+fn lenient_millis<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_i64())
 }
 
 /// Why a profile's credentials cannot currently produce a reading. These are
@@ -75,6 +93,9 @@ pub struct Credentials {
     /// Present only when `state == Ok`.
     pub access_token: Option<String>,
     pub expires_at: Option<Timestamp>,
+    /// When the refresh token (the login itself) expires. Plays no part in
+    /// classification.
+    pub refresh_token_expires_at: Option<Timestamp>,
     pub subscription_type: Option<String>,
 }
 
@@ -114,6 +135,7 @@ pub fn read(config_dir: &Path, now: Timestamp) -> Credentials {
         state,
         access_token: None,
         expires_at: None,
+        refresh_token_expires_at: None,
         subscription_type: None,
     };
     let missing = bare(AuthState::Missing);
@@ -140,6 +162,9 @@ pub fn read(config_dir: &Path, now: Timestamp) -> Credentials {
     let expires_at = oauth
         .expires_at
         .and_then(|ms| Timestamp::from_millisecond(ms).ok());
+    let refresh_token_expires_at = oauth
+        .refresh_token_expires_at
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok());
 
     // No expiry field: assume usable and let a 401 tell us otherwise. Guessing
     // "stale" would blind us to a perfectly good token.
@@ -153,6 +178,7 @@ pub fn read(config_dir: &Path, now: Timestamp) -> Credentials {
             state: AuthState::Stale,
             access_token: None,
             expires_at,
+            refresh_token_expires_at,
             subscription_type: oauth.subscription_type,
         }
     } else {
@@ -160,6 +186,7 @@ pub fn read(config_dir: &Path, now: Timestamp) -> Credentials {
             state: AuthState::Ok,
             access_token: Some(token),
             expires_at,
+            refresh_token_expires_at,
             subscription_type: oauth.subscription_type,
         }
     }
@@ -255,5 +282,82 @@ mod tests {
         let c = read(d.path(), Timestamp::now());
         assert_eq!(c.state, AuthState::Ok);
         assert!(c.is_usable());
+    }
+
+    fn creds_json_with_refresh(token: &str, expires_at_ms: i64, refresh: &str) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{token}","refreshToken":"rt",
+               "expiresAt":{expires_at_ms},"refreshTokenExpiresAt":{refresh},
+               "subscriptionType":"max"}}}}"#
+        )
+    }
+
+    #[test]
+    fn reads_refresh_token_expiry_for_live_and_expired_tokens() {
+        let now = Timestamp::from_second(1_000_000).unwrap();
+        let refresh_ms = (now.as_second() + 86_400 * 20) * 1000;
+        let want = Timestamp::from_millisecond(refresh_ms).unwrap();
+        for (access_ms, state) in [
+            ((now.as_second() + 3600) * 1000, AuthState::Ok),
+            ((now.as_second() - 3600) * 1000, AuthState::Stale),
+        ] {
+            let d = dir_with(&creds_json_with_refresh(
+                "t",
+                access_ms,
+                &refresh_ms.to_string(),
+            ));
+            let c = read(d.path(), now);
+            assert_eq!(c.state, state);
+            assert_eq!(c.refresh_token_expires_at, Some(want));
+            assert_eq!(
+                c.expires_at,
+                Some(Timestamp::from_millisecond(access_ms).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn file_without_refresh_token_expiry_yields_none() {
+        let now = Timestamp::from_second(1_000_000).unwrap();
+        let d = dir_with(&creds_json("live", (now.as_second() + 3600) * 1000));
+        let c = read(d.path(), now);
+        assert_eq!(c.state, AuthState::Ok);
+        assert!(c.is_usable());
+        assert_eq!(c.refresh_token_expires_at, None);
+    }
+
+    #[test]
+    fn malformed_refresh_token_expiry_does_not_fail_the_parse() {
+        // An informational field changing type must not make the file
+        // Unreadable, which would eventually commit a healthy profile `missing`.
+        let now = Timestamp::from_second(1_000_000).unwrap();
+        let access_ms = (now.as_second() + 3600) * 1000;
+        for bad in [
+            r#""1700000000000""#,
+            "1700000000000.5",
+            "null",
+            "99999999999999999999",
+            r#"{"x":1}"#,
+        ] {
+            let d = dir_with(&creds_json_with_refresh("live", access_ms, bad));
+            let c = read(d.path(), now);
+            assert_eq!(c.state, AuthState::Ok, "value {bad}");
+            assert!(c.is_usable(), "value {bad}");
+            assert_eq!(c.refresh_token_expires_at, None, "value {bad}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_refresh_token_expiry_yields_none() {
+        let now = Timestamp::from_second(1_000_000).unwrap();
+        let access_ms = (now.as_second() + 3600) * 1000;
+        let d = dir_with(&creds_json_with_refresh(
+            "live",
+            access_ms,
+            &i64::MAX.to_string(),
+        ));
+        let c = read(d.path(), now);
+        assert_eq!(c.state, AuthState::Ok);
+        assert_eq!(c.refresh_token_expires_at, None);
     }
 }

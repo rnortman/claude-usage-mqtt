@@ -80,6 +80,9 @@ async fn healthy_poll_publishes_the_whole_tree() {
     );
     assert_eq!(snap["auth"], "ok");
     assert_eq!(snap["subscription_type"], "max");
+    let (access_exp, refresh_exp) = profs.expiries("live");
+    assert_eq!(ts(&snap["access_token_expires_at"]), access_exp);
+    assert_eq!(ts(&snap["refresh_token_expires_at"]), refresh_exp);
     assert_eq!(snap["windows"].as_array().unwrap().len(), 3);
     // Retention has no inherent age: without these a consumer cannot tell a
     // fresh reading from an ancient one.
@@ -334,10 +337,13 @@ async fn a_stale_profile_is_refreshed_by_the_cli_and_then_polled() {
         &[("stale", stale.clone())],
     );
     // The daemon judges the outcome by re-reading the file, not by trusting
-    // the CLI's exit status.
-    let script = "exp=$(( ($(date +%s) + 3600) * 1000 )); \
-                  printf '{\"claudeAiOauth\":{\"accessToken\":\"renewed\",\"expiresAt\":%s}}' \
-                  \"$exp\" > \"$CLAUDE_CONFIG_DIR/.credentials.json\"";
+    // the CLI's exit status. The renewed refresh-token expiry (two weeks)
+    // differs from the fixture's (four weeks), so the snapshot shows which
+    // read it was built from.
+    let script = "now=$(date +%s); exp=$(( (now + 3600) * 1000 )); \
+                  rexp=$(( (now + 14 * 86400) * 1000 )); \
+                  printf '{\"claudeAiOauth\":{\"accessToken\":\"renewed\",\"expiresAt\":%s,\"refreshTokenExpiresAt\":%s}}' \
+                  \"$exp\" \"$rexp\" > \"$CLAUDE_CONFIG_DIR/.credentials.json\"";
     enable_refresh(&cfg, "sh", &["-c", script]);
 
     let col = Collector::start(broker.port, "t33", "col-t33").await;
@@ -357,6 +363,17 @@ async fn a_stale_profile_is_refreshed_by_the_cli_and_then_polled() {
     );
     let creds = std::fs::read_to_string(stale.join(".credentials.json")).unwrap();
     assert!(creds.contains("renewed"), "the CLI stand-in never ran");
+    let (access_exp, refresh_exp) = profs.expiries("stale");
+    assert_eq!(
+        ts(&snap["access_token_expires_at"]),
+        access_exp,
+        "the snapshot must carry the renewed access-token expiry, not the dead one"
+    );
+    assert_eq!(
+        ts(&snap["refresh_token_expires_at"]),
+        refresh_exp,
+        "the snapshot must carry the renewed file's refresh-token expiry"
+    );
 }
 
 /// The published advice has to survive the refresh path failing: the profile is
@@ -391,7 +408,9 @@ async fn a_failed_refresh_publishes_stale_with_the_advice_that_is_left() {
 }
 
 /// With refresh disabled, an expired profile stays `stale` and no subprocess is
-/// spawned.
+/// spawned. Its snapshot still carries both credential expiries, read off the
+/// file without an API call: the refresh-token expiry is what tells a consumer
+/// whether the profile can heal without a re-login.
 #[tokio::test]
 async fn a_disabled_refresh_leaves_an_expired_profile_stale() {
     let broker = broker_or_skip!();
@@ -399,7 +418,7 @@ async fn a_disabled_refresh_leaves_an_expired_profile_stale() {
     let profs = Profiles::new();
     let stale = profs.add("stale", -100);
     let dir = tempfile::tempdir().unwrap();
-    // `write_config` writes `refresh.enabled = false`; no `enable_refresh` call.
+    // Relies on `write_config` disabling refresh, so the profile stays stale; no `enable_refresh` call.
     let cfg = write_config(
         dir.path(),
         broker.port,
@@ -412,7 +431,24 @@ async fn a_disabled_refresh_leaves_an_expired_profile_stale() {
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
 
     assert_eq!(col.last("t34/profile/stale/auth").as_deref(), Some("stale"));
-    assert_eq!(mock.call_count().await, 0);
+    let snap = col.json("t34/profile/stale/snapshot").expect("snapshot");
+    assert_eq!(snap["auth"], "stale");
+    let (access_exp, refresh_exp) = profs.expiries("stale");
+    assert_eq!(
+        ts(&snap["access_token_expires_at"]),
+        access_exp,
+        "stale snapshot's access-token expiry"
+    );
+    assert_eq!(
+        ts(&snap["refresh_token_expires_at"]),
+        refresh_exp,
+        "stale snapshot's refresh-token expiry"
+    );
+    assert_eq!(
+        mock.call_count().await,
+        0,
+        "a stale profile, or publishing its expiries, spent an API call"
+    );
 }
 
 /// A never-logged-in profile (no `.credentials.json` at all) must report `missing`
@@ -1325,6 +1361,7 @@ async fn a_known_rejected_token_is_not_re_polled_when_due() {
         "the rejected token hash must persist through retained bookkeeping"
     );
     backdate(broker.port, "t18", "live", &col).await;
+    let snapshots_before = col.count("t18/profile/live/snapshot");
     run_daemon_for(&cfg, &mock.endpoint(), 2.0).await.unwrap();
 
     assert_eq!(
@@ -1335,6 +1372,23 @@ async fn a_known_rejected_token_is_not_re_polled_when_due() {
     assert_eq!(
         col.last("t18/profile/live/auth").as_deref(),
         Some("rejected")
+    );
+    assert!(
+        col.count("t18/profile/live/snapshot") > snapshots_before,
+        "the parked profile published no snapshot on the second run"
+    );
+    let snap = col.json("t18/profile/live/snapshot").expect("snapshot");
+    assert_eq!(snap["auth"], "rejected");
+    let (access_exp, refresh_exp) = profs.expiries("live");
+    assert_eq!(
+        ts(&snap["access_token_expires_at"]),
+        access_exp,
+        "a rejected profile must keep its access-token expiry"
+    );
+    assert_eq!(
+        ts(&snap["refresh_token_expires_at"]),
+        refresh_exp,
+        "a rejected profile must keep its refresh-token expiry"
     );
 }
 

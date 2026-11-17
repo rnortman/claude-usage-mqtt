@@ -81,6 +81,18 @@ struct ProfileRuntime {
     /// config would allow. In-memory: after a restart nothing has been attempted
     /// yet, which is exactly what `None` says.
     refresh_outcome: Option<RefreshOutcome>,
+    /// The access-token and refresh-token expiries from this process's last
+    /// definite credentials read, copied into every snapshot. In-memory only:
+    /// no snapshot is built before this process has read the file, so nothing
+    /// here needs to survive a restart.
+    expiries: Expiries,
+}
+
+/// Credential expiries as last read from a profile's credentials file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Expiries {
+    access_token: Option<Timestamp>,
+    refresh_token: Option<Timestamp>,
 }
 
 /// What became of the most recent refresh attempt on a profile. Only the cases
@@ -116,7 +128,21 @@ impl ProfileRuntime {
             retry_at: None,
             consecutive_unreadable: 0,
             refresh_outcome: None,
+            expiries: Expiries::default(),
         }
+    }
+
+    /// Store the expiries a credentials read carried. A definite read replaces
+    /// both, absent values included; an `Unreadable` read says nothing about
+    /// the file, so the previous values stand.
+    fn record_expiries(&mut self, c: &Credentials) {
+        if c.state == AuthState::Unreadable {
+            return;
+        }
+        self.expiries = Expiries {
+            access_token: c.expires_at,
+            refresh_token: c.refresh_token_expires_at,
+        };
     }
 
     /// Whether a refresh attempt for this profile is worth making now: off
@@ -637,6 +663,7 @@ impl Daemon {
 
             for (i, c) in &due {
                 self.classify_auth(*i, &c.state).await;
+                self.profiles[*i].record_expiries(c);
                 if c.subscription_type.is_some() {
                     self.profiles[*i].book.subscription_type = c.subscription_type.clone();
                 }
@@ -1108,6 +1135,9 @@ impl Daemon {
             warn!(profile = %name, "credentials unreadable repeatedly; committing missing");
             p.retry_at = None;
             p.consecutive_unreadable = 0;
+            // The snapshot about to say "no credentials" must not carry the
+            // expiry of a file that can no longer be read.
+            p.expiries = Expiries::default();
             Box::pin(self.commit_unusable(
                 idx,
                 now,
@@ -1333,6 +1363,8 @@ impl Daemon {
             poll_interval_s: interval,
             stale_reason: stale_reason.map(str::to_string),
             subscription_type: p.book.subscription_type.clone(),
+            access_token_expires_at: p.expiries.access_token,
+            refresh_token_expires_at: p.expiries.refresh_token,
             windows: p.book.last_windows.clone(),
         })
     }
@@ -2850,6 +2882,105 @@ mod tests {
         assert!(!d.profiles[0].book.last_windows.is_empty());
 
         assert!(d.build_snapshot(0, Timestamp::now(), None).is_none());
+    }
+
+    fn creds_with(
+        state: AuthState,
+        access: Option<Timestamp>,
+        refresh: Option<Timestamp>,
+    ) -> Credentials {
+        Credentials {
+            state,
+            access_token: (state == AuthState::Ok).then(|| "tok".to_string()),
+            expires_at: access,
+            refresh_token_expires_at: refresh,
+            subscription_type: None,
+        }
+    }
+
+    fn at(s: i64) -> Option<Timestamp> {
+        Some(Timestamp::from_second(s).unwrap())
+    }
+
+    /// Both expiries from a definite read reach the snapshot, whether the token
+    /// is live or aged out: a stale profile's refresh-token expiry is what tells
+    /// a consumer whether it can still heal without a re-login.
+    #[tokio::test]
+    async fn recorded_expiries_reach_the_snapshot_for_ok_and_stale() {
+        for state in [AuthState::Ok, AuthState::Stale] {
+            let mut d = snapshot_daemon("t-snap-expiries");
+            d.profiles[0].auth = Some(state);
+            d.profiles[0].record_expiries(&creds_with(state, at(1_800_000_000), at(1_802_000_000)));
+            let snap = d
+                .build_snapshot(0, Timestamp::now(), None)
+                .expect("a classified profile publishes");
+            assert_eq!(snap.access_token_expires_at, at(1_800_000_000), "{state:?}");
+            assert_eq!(
+                snap.refresh_token_expires_at,
+                at(1_802_000_000),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// A file caught mid-rewrite says nothing about the credentials, so the
+    /// last definite expiries stand — a reconnect repair in the debounce
+    /// window must not drop them.
+    #[tokio::test]
+    async fn an_unreadable_read_leaves_the_recorded_expiries_standing() {
+        let mut d = snapshot_daemon("t-snap-expiries-unreadable");
+        d.profiles[0].record_expiries(&creds_with(
+            AuthState::Ok,
+            at(1_800_000_000),
+            at(1_802_000_000),
+        ));
+        d.profiles[0].record_expiries(&creds_with(AuthState::Unreadable, None, None));
+        let snap = d
+            .build_snapshot(0, Timestamp::now(), None)
+            .expect("a classified profile publishes");
+        assert_eq!(snap.access_token_expires_at, at(1_800_000_000));
+        assert_eq!(snap.refresh_token_expires_at, at(1_802_000_000));
+    }
+
+    /// A definite read replaces both values, absences included: a file that
+    /// stopped carrying the refresh-token expiry must not keep publishing the
+    /// old one.
+    #[tokio::test]
+    async fn a_definite_read_without_a_refresh_expiry_removes_it() {
+        let mut d = snapshot_daemon("t-snap-expiries-removed");
+        d.profiles[0].record_expiries(&creds_with(
+            AuthState::Ok,
+            at(1_800_000_000),
+            at(1_802_000_000),
+        ));
+        d.profiles[0].record_expiries(&creds_with(AuthState::Ok, at(1_800_003_600), None));
+        let snap = d
+            .build_snapshot(0, Timestamp::now(), None)
+            .expect("a classified profile publishes");
+        assert_eq!(snap.access_token_expires_at, at(1_800_003_600));
+        assert_eq!(snap.refresh_token_expires_at, None);
+    }
+
+    /// The unreadable give-up commits `missing`, and a snapshot saying there are
+    /// no credentials must not carry the expiry of a file it cannot read.
+    #[tokio::test(start_paused = true)]
+    async fn the_unreadable_give_up_clears_the_expiries() {
+        let mut d = snapshot_daemon("t-snap-expiries-giveup");
+        d.profiles[0].record_expiries(&creds_with(
+            AuthState::Ok,
+            at(1_800_000_000),
+            at(1_802_000_000),
+        ));
+        let now = Timestamp::now();
+        for _ in 0..UNREADABLE_MAX_TRIES {
+            d.handle_unusable(0, now, &AuthState::Unreadable).await;
+        }
+        assert_eq!(d.profiles[0].auth, Some(AuthState::Missing));
+        let snap = d
+            .build_snapshot(0, now, None)
+            .expect("a classified profile publishes");
+        assert_eq!(snap.access_token_expires_at, None);
+        assert_eq!(snap.refresh_token_expires_at, None);
     }
 
     /// The retry that turns a recorded resume point into an actual second
